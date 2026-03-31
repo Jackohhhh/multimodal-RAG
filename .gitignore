@@ -22,3 +22,5 @@ Thumbs.db
 # 其他
 index/
 finetune/checkpoints/
+workspace/
+howtouse.md
