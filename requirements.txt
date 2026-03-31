@@ -1,0 +1,18 @@
+langchain-classic 
+langchain
+langchain-openai
+openai
+langchain-google-genai #谷歌的api
+langchain_community
+pypdf
+faiss-cpu
+flashrank
+rank_bm25
+docx2txt
+pymilvus
+langchain-milvus
+langchain-huggingface
+sentence-transformers
+pymilvus[milvus-lite]
+redis
+pymysql
