@@ -1,0 +1,48 @@
+# ============================================================
+# 多模态客服智能体 - 主配置文件
+# ============================================================
+
+# --- 大语言模型 ---
+llm:
+  model: "kimi-k2-0905-preview"
+  provider: "openai"
+  temperature: 0
+  timeout: 60
+  max_tokens: 2000
+
+# 多模态模型（用于图片理解、caption 生成）
+multimodal_llm:
+  model: "moonshot-v1-8k"
+  provider: "openai"
+  temperature: 0.1
+  timeout: 60
+  max_tokens: 1000
+
+# --- Embedding 模型 ---
+embeddings:
+  model_name: "BAAI/bge-m3"  # 多语言模型，同时支持中英文
+
+# --- 数据路径 ---
+data:
+  manuals_path: "./data/manuals"        # 存放 [text, [image_ids]] 格式的 JSON 文件
+  images_path: "./data/images"          # 配图文件（按图片ID命名）
+  chunks_output: "./data_processed/chunks/chunks.jsonl"
+
+# --- 向量数据库 ---
+vector_store:
+  connection_args:
+    uri: "https://in03-6499fcae9264c18.serverless.gcp-us-west1.cloud.zilliz.com"
+    token: "${ZILLIZ_TOKEN}"  # 建议通过环境变量传入
+  collection_name: "multimodal_customer_service_v1"
+
+# --- 文本切分 ---
+chunking:
+  chunk_size: 800
+  chunk_overlap: 150
+
+# --- 检索参数 ---
+retrieval:
+  search_k: 8
+  rerank_top_n: 8
+  use_rerank: false
+

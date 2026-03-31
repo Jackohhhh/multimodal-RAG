@@ -1,18 +1,44 @@
-langchain-classic 
+# === LLM & LangChain 核心 ===
+langchain-classic
 langchain
 langchain-openai
 openai
-langchain-google-genai #谷歌的api
+langchain-google-genai
 langchain_community
-pypdf
-faiss-cpu
-flashrank
-rank_bm25
-docx2txt
-pymilvus
-langchain-milvus
 langchain-huggingface
 sentence-transformers
+sentencepiece            # bge-m3 (XLMRoberta) tokenizer 依赖
+
+# === 向量数据库 ===
+pymilvus
 pymilvus[milvus-lite]
+langchain-milvus
+faiss-cpu
+
+# === 检索增强 ===
+flashrank
+rank_bm25
+
+# === 文档解析 ===
+pypdf
+docx2txt
+PyMuPDF                # PDF 图片提取（fitz）
+pdfplumber             # PDF 精细解析（表格/布局）
+Pillow                 # 图片处理
+
+# === 数据存储 & 记忆 ===
 redis
 pymysql
+sqlalchemy
+
+# === 配置管理 ===
+pyyaml
+
+# === 微调相关（按需安装） ===
+# transformers
+# peft
+# datasets
+# accelerate
+
+# === 评测 ===
+pydantic

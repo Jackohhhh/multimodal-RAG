@@ -1,8 +1,24 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
+*.egg-info/
+
+# 敏感文件（含 API Key）
 set_env.sh
+
+# 生成文件（可通过 preprocess 重新生成）
+data_processed/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 其他
 index/
 finetune/checkpoints/
-*.egg-info/
