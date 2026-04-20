@@ -8,7 +8,7 @@ llm:
   provider: "openai"
   temperature: 0
   timeout: 60
-  max_tokens: 2000
+  max_tokens: 1000
 
 # 多模态模型（用于图片理解、caption 生成）
 multimodal_llm:
@@ -30,10 +30,8 @@ data:
 
 # --- 向量数据库 ---
 vector_store:
-  connection_args:
-    uri: "https://in03-6499fcae9264c18.serverless.gcp-us-west1.cloud.zilliz.com"
-    token: "${ZILLIZ_TOKEN}"  # 建议通过环境变量传入
-  collection_name: "multimodal_customer_service_v1"
+  type: "faiss"
+  index_path: "./index/text_index/faiss"
 
 # --- 文本切分 ---
 chunking:
@@ -45,4 +43,4 @@ retrieval:
   search_k: 8
   rerank_top_n: 8
   use_rerank: false
-
+  rag_relevance_threshold: 0.41

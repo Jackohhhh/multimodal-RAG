@@ -5,6 +5,7 @@
 import argparse
 import logging
 import os
+import subprocess
 import sys
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -19,9 +20,8 @@ def cmd_preprocess(args):
         load_pic_documents_from_dir, build_documents_with_images,
     )
     from src.preprocess.chunk_text import chunk_marked_text, save_chunks_to_jsonl
+    from src.vector_store import build_vector_store
     from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_milvus import Milvus
-    from pymilvus import connections, MilvusClient
     import yaml
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -67,37 +67,13 @@ def cmd_preprocess(args):
     embeddings = HuggingFaceEmbeddings(
         model_name=config["embeddings"]["model_name"]
     )
-
-    conn_args = config["vector_store"]["connection_args"]
-    collection_name = config["vector_store"]["collection_name"]
-
-    from pymilvus import utility
-
-    bootstrap_client = MilvusClient(**conn_args)
-    alias = bootstrap_client._using
-    if not connections.has_connection(alias):
-        connections.connect(alias=alias, **conn_args)
-
-    if utility.has_collection(collection_name, using=alias):
-        utility.drop_collection(collection_name, using=alias)
-        print(f"已删除旧集合 '{collection_name}'")
-
-    vector_store = Milvus(
-        connection_args=conn_args,
-        collection_name=collection_name,
-        embedding_function=embeddings,
-        auto_id=True,
-        drop_old=False,
-    )
-
-    import json as _json
-    for doc in all_chunks:
-        imgs = doc.metadata.get("related_images")
-        if isinstance(imgs, list):
-            doc.metadata["related_images"] = _json.dumps(imgs, ensure_ascii=False)
-
-    vector_store.add_documents(all_chunks)
-    print(f"已将 {len(all_chunks)} 个片段索引到 Milvus 集合 '{collection_name}'")
+    vector_store_cfg = config["vector_store"]
+    build_vector_store(all_chunks, embeddings, vector_store_cfg)
+    store_type = vector_store_cfg.get("type", "faiss").lower()
+    if store_type == "faiss":
+        print(f"已将 {len(all_chunks)} 个片段写入 FAISS 索引 '{vector_store_cfg['index_path']}'")
+    else:
+        print(f"已将 {len(all_chunks)} 个片段索引到 Milvus 集合 '{vector_store_cfg['collection_name']}'")
 
     print("\n预处理完成！")
 
@@ -131,12 +107,20 @@ def cmd_chat(args):
 
 def cmd_eval(args):
     """批量评测模式"""
-    os.system(
-        f"python eval/eval_runner.py "
-        f"--config {args.config} --prompts {args.prompts} "
-        f"--questions {args.questions} --output {args.output} "
-        f"--submission {args.submission}"
-    )
+    cmd = [
+        sys.executable,
+        "eval/eval_runner.py",
+        "--config", args.config,
+        "--prompts", args.prompts,
+        "--questions", args.questions,
+        "--output", args.output,
+        "--submission", args.submission,
+    ]
+    if args.cot:
+        cmd.append("--cot")
+    if args.hallucination_check:
+        cmd.append("--hallucination-check")
+    subprocess.run(cmd, check=True)
 
 
 def main():
@@ -159,6 +143,8 @@ def main():
     sub_eval.add_argument("--questions", default="eval/questions/questions_A.jsonl")
     sub_eval.add_argument("--output", default="eval/results/results_A.jsonl")
     sub_eval.add_argument("--submission", default="submissions/answer_A.json")
+    sub_eval.add_argument("--cot", action="store_true", help="启用思维链拆解")
+    sub_eval.add_argument("--hallucination-check", action="store_true", help="启用幻觉检查")
 
     args = parser.parse_args()
 

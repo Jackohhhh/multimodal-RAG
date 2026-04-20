@@ -1,4 +1,5 @@
 """公共工具函数"""
+import os
 import re
 from typing import List, Tuple
 from langchain_core.documents import Document
@@ -45,3 +46,60 @@ def postprocess_answer(answer: str) -> Tuple[str, List[str]]:
     image_ids = re.findall(r'\[IMG:([^\]]+)\]', answer)
     text_with_pic = re.sub(r'\n?\[IMG:[^\]]+\]\n?', '<PIC>', answer)
     return text_with_pic, image_ids
+
+
+def is_verbose_retrieval_enabled() -> bool:
+    """读取检索调试开关，兼容常见拼写。"""
+    value = (
+        os.getenv("RAG_VERBOSE_RETRIEVAL")
+        or os.getenv("RAG_VERBOSE_RETRIEVA")
+        or ""
+    ).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def preview_text(text: str, limit: int = 120) -> str:
+    """生成单行预览，便于打印检索日志。"""
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + "..."
+
+
+def log_retrieved_docs(
+    query: str,
+    docs: List[Document],
+    *,
+    pre_filter_hit_count: int | None = None,
+    rag_relevance_threshold: float | None = None,
+) -> None:
+    """
+    按环境变量控制输出检索命中摘要。
+    默认在「阈值过滤之后」传入 docs，使 Hits 与进入 RAG 上下文的片段一致。
+    """
+    if not is_verbose_retrieval_enabled():
+        return
+
+    print("\n=== RAG Retrieval ===")
+    print(f"Query: {preview_text(query, limit=200)}")
+    if pre_filter_hit_count is not None and rag_relevance_threshold is not None:
+        print(
+            f"按 relevance_score > {rag_relevance_threshold} 过滤："
+            f"原始 {pre_filter_hit_count} 条 → 进入 RAG 上下文 {len(docs)} 条"
+        )
+    print(f"Hits: {len(docs)}")
+    if not docs:
+        if pre_filter_hit_count and pre_filter_hit_count > 0:
+            print(
+                "（无片段超过阈值：不向 RAG 主模型传入手册片段；"
+                "若仍生成回答，则来自客服兜底模型。）"
+            )
+        return
+    for i, doc in enumerate(docs, start=1):
+        score = doc.metadata.get("relevance_score", 0.0)
+        source = doc.metadata.get("source", "未知")
+        images = doc.metadata.get("related_images", [])
+        print(
+            f"[{i}] source={source} score={score:.2f} images={len(images)} "
+            f"text={preview_text(doc.page_content)}"
+        )

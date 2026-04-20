@@ -4,20 +4,23 @@
 输出格式："回答文本(含<PIC>)", [图片ID列表]
 """
 import os
+import re
 import yaml
 from typing import Optional, Tuple, List
 
 from langchain.chat_models import init_chat_model
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from src.utils import format_docs, postprocess_answer
+from src.utils import format_docs, postprocess_answer, log_retrieved_docs
 from src.retrieval.text_retriever import build_text_retriever
 from src.retrieval.multimodal_retriever import MultimodalRetriever
 from src.agent.chain_of_thought import decompose_question, merge_answers
-from src.agent.hallucination import apply_hallucination_filter
+from src.agent.hallucination import check_grounding, LOW_CONFIDENCE_DISCLAIMER
 from src.agent.multimodal_input import build_multimodal_query
+from src.vector_store import load_vector_store
 
 
 def load_config(config_path: str = "configs/config.yaml") -> dict:
@@ -34,6 +37,29 @@ def load_prompts(prompts_path: str = "configs/prompts.yaml") -> dict:
 class CustomerServiceAgent:
     """多模态客服智能体"""
 
+    GENERIC_CUSTOMER_SERVICE_PATTERNS = (
+        r"退款",
+        r"退货",
+        r"换货",
+        r"取消订单",
+        r"订单.*取消",
+        r"发票",
+        r"物流",
+        r"快递",
+        r"揽收",
+        r"签收",
+        r"投诉",
+        r"补发",
+        r"补寄",
+        r"少发",
+        r"漏发",
+        r"运费",
+        r"赔偿",
+        r"售后",
+        r"到货",
+        r"到账",
+    )
+
     def __init__(self, config: dict, prompts: dict):
         self.config = config
         self.prompts = prompts
@@ -43,29 +69,20 @@ class CustomerServiceAgent:
         self.embeddings = HuggingFaceEmbeddings(
             model_name=config["embeddings"]["model_name"]
         )
-
-        from langchain_milvus import Milvus
-        from pymilvus import connections, MilvusClient
-
-        conn_args = config["vector_store"]["connection_args"]
-        bootstrap_client = MilvusClient(**conn_args)
-        alias = bootstrap_client._using
-        if not connections.has_connection(alias):
-            connections.connect(alias=alias, **conn_args)
-
-        self.vector_store = Milvus(
-            connection_args=conn_args,
-            collection_name=config["vector_store"]["collection_name"],
-            embedding_function=self.embeddings,
-            auto_id=True,
-            drop_old=False,
+        self.vector_store = load_vector_store(
+            self.embeddings,
+            config["vector_store"],
         )
 
+        retrieval_cfg = config["retrieval"]
         self.text_retriever = build_text_retriever(
             self.vector_store,
-            search_k=config["retrieval"]["search_k"],
-            rerank_top_n=config["retrieval"]["rerank_top_n"],
-            use_rerank=config["retrieval"]["use_rerank"],
+            search_k=retrieval_cfg["search_k"],
+            rerank_top_n=retrieval_cfg["rerank_top_n"],
+            use_rerank=retrieval_cfg["use_rerank"],
+        )
+        self.rag_relevance_threshold = float(
+            retrieval_cfg.get("rag_relevance_threshold", 0.40)
         )
 
         self.multimodal_retriever = MultimodalRetriever(
@@ -74,6 +91,13 @@ class CustomerServiceAgent:
 
         self.rag_prompt = ChatPromptTemplate.from_template(
             prompts["rag_prompt"]
+        )
+        fallback_prompt = prompts.get("fallback_customer_service_prompt") or (
+            "你现在扮演商家在线客服。请直接回答用户问题，不要提及知识库、说明书、检索或模型。"
+            "\n\n【用户问题】：\n{question}\n\n【客服回答】："
+        )
+        self.customer_service_fallback_prompt = ChatPromptTemplate.from_template(
+            fallback_prompt
         )
         self.decompose_prompt_tpl = prompts.get("decompose_prompt")
         self.merge_prompt_tpl = prompts.get("merge_prompt")
@@ -107,6 +131,11 @@ class CustomerServiceAgent:
         """
         query = build_multimodal_query(question, image_path, self.multimodal_llm)
 
+        if self._should_use_customer_service_directly(query):
+            fallback_answer = self._fallback_customer_service_answer(question)
+            text_with_pic, image_ids = postprocess_answer(fallback_answer)
+            return text_with_pic, image_ids
+
         if enable_cot:
             sub_questions = decompose_question(
                 query, self.llm, prompt_template=self.decompose_prompt_tpl
@@ -118,7 +147,23 @@ class CustomerServiceAgent:
 
         for sub_q in sub_questions:
             docs = self.multimodal_retriever.retrieve(sub_q)
+            pre_filter_n = len(docs)
+            docs = self._filter_docs_above_rag_threshold(docs)
+            log_retrieved_docs(
+                sub_q,
+                docs,
+                pre_filter_hit_count=pre_filter_n,
+                rag_relevance_threshold=self.rag_relevance_threshold,
+            )
+            if not docs:
+                sub_answers.append(self._fallback_customer_service_answer(sub_q))
+                continue
+
             context = format_docs(docs)
+
+            if not context.strip():
+                sub_answers.append(self._fallback_customer_service_answer(sub_q))
+                continue
 
             response = (
                 self.rag_prompt
@@ -129,13 +174,19 @@ class CustomerServiceAgent:
                 "question": sub_q,
             })
 
-            filtered = apply_hallucination_filter(
-                context=context,
-                answer=response,
-                llm=self.llm,
-                enable_check=enable_hallucination_check,
-            )
-            sub_answers.append(filtered)
+            if self._needs_customer_service_fallback(response):
+                sub_answers.append(self._fallback_customer_service_answer(sub_q))
+                continue
+
+            if enable_hallucination_check:
+                grounding = check_grounding(context, response, self.llm)
+                if grounding == "HALLUCINATION":
+                    sub_answers.append(self._fallback_customer_service_answer(sub_q))
+                    continue
+                if grounding == "PARTIAL":
+                    response = response + LOW_CONFIDENCE_DISCLAIMER
+
+            sub_answers.append(response)
 
         raw_answer = merge_answers(
             question, sub_answers, self.llm,
@@ -144,3 +195,44 @@ class CustomerServiceAgent:
 
         text_with_pic, image_ids = postprocess_answer(raw_answer)
         return text_with_pic, image_ids
+
+    def _filter_docs_above_rag_threshold(self, docs: List[Document]) -> List[Document]:
+        """仅保留 relevance_score 严格大于 rag_relevance_threshold 的片段供 RAG 使用。"""
+        thr = self.rag_relevance_threshold
+        kept: List[Document] = []
+        for doc in docs:
+            raw = doc.metadata.get("relevance_score")
+            if raw is None:
+                continue
+            try:
+                if float(raw) > thr:
+                    kept.append(doc)
+            except (TypeError, ValueError):
+                continue
+        return kept
+
+    def _fallback_customer_service_answer(self, question: str) -> str:
+        """说明书缺少依据时，切换到商家客服口径回答。"""
+        return (
+            self.customer_service_fallback_prompt
+            | self.llm
+            | StrOutputParser()
+        ).invoke({"question": question}).strip()
+
+    @staticmethod
+    def _needs_customer_service_fallback(answer: str) -> bool:
+        """识别 RAG 提示词返回的无答案信号。"""
+        normalized = re.sub(r"\s+", "", answer or "")
+        fallback_signals = (
+            "未找到相关信息",
+            "没有相关信息",
+            "无法找到相关信息",
+            "无法从上下文中找到",
+        )
+        return (not normalized) or any(signal in normalized for signal in fallback_signals)
+
+    @classmethod
+    def _should_use_customer_service_directly(cls, question: str) -> bool:
+        """通用售后类问题优先走客服兜底，不进入说明书 RAG。"""
+        normalized = re.sub(r"\s+", "", question or "")
+        return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in cls.GENERIC_CUSTOMER_SERVICE_PATTERNS)

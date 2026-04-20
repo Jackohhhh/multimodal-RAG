@@ -4,8 +4,10 @@
 import os
 import json
 import argparse
+import csv
 import re
-from typing import List, Dict
+from pathlib import Path
+from typing import List, Dict, Optional
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -56,27 +58,113 @@ def judge_single(question: str, answer: str, judge_llm) -> Dict:
     return {"score": score, "reasoning": reasoning}
 
 
-def evaluate_results(
-    results_path: str,
-    output_path: str,
-    judge_llm,
-) -> Dict:
-    """批量评测结果文件"""
-    results = []
+def _normalize_id(raw_id) -> str:
+    return str(raw_id).strip()
+
+
+def load_questions_map(questions_path: str) -> Dict[str, str]:
+    """加载题目文件，返回 id -> question。支持 CSV / JSONL。"""
+    suffix = Path(questions_path).suffix.lower()
+    questions_map = {}
+
+    if suffix == ".csv":
+        with open(questions_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                qid = _normalize_id(row.get("id", ""))
+                question = (row.get("question") or "").strip()
+                if qid:
+                    questions_map[qid] = question
+        return questions_map
+
+    with open(questions_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            qid = _normalize_id(row.get("id", ""))
+            question = (row.get("question") or "").strip()
+            if qid:
+                questions_map[qid] = question
+    return questions_map
+
+
+def load_answer_records(results_path: str) -> List[Dict]:
+    """
+    加载待评测答案文件。
+    支持:
+    - results jsonl: 含 question + answer
+    - submission csv: id + ret/answer
+    - submission json/jsonl: id + answer
+    """
+    suffix = Path(results_path).suffix.lower()
+
+    if suffix == ".csv":
+        records = []
+        with open(results_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                records.append({
+                    "id": _normalize_id(row.get("id", "")),
+                    "question": (row.get("question") or "").strip(),
+                    "answer": (row.get("ret") or row.get("answer") or "").strip(),
+                })
+        return records
+
+    if suffix == ".json":
+        with open(results_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        records = []
+        for row in data:
+            records.append({
+                "id": _normalize_id(row.get("id", "")),
+                "question": (row.get("question") or "").strip(),
+                "answer": (row.get("ret") or row.get("answer") or "").strip(),
+            })
+        return records
+
+    records = []
     with open(results_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            results.append(json.loads(line))
+            row = json.loads(line)
+            records.append({
+                "id": _normalize_id(row.get("id", "")),
+                "question": (row.get("question") or "").strip(),
+                "answer": (row.get("ret") or row.get("answer") or "").strip(),
+            })
+    return records
+
+
+def evaluate_results(
+    results_path: str,
+    output_path: str,
+    judge_llm,
+    questions_path: Optional[str] = None,
+) -> Dict:
+    """批量评测结果文件或提交文件。"""
+    results = load_answer_records(results_path)
+    questions_map = load_questions_map(questions_path) if questions_path else {}
 
     evaluated = []
     total_score = 0
 
     for i, r in enumerate(results):
-        print(f"[{i+1}/{len(results)}] 评测题目 {r.get('id', i+1)}...")
-        judgment = judge_single(r["question"], r["answer"], judge_llm)
-        entry = {**r, **judgment}
+        qid = _normalize_id(r.get("id", i + 1))
+        question = r.get("question", "").strip() or questions_map.get(qid, "")
+        answer = r.get("answer", "").strip()
+
+        if not question:
+            raise ValueError(
+                f"题目 {qid} 缺少 question，且未能从 --questions 提供的题库中补全。"
+            )
+
+        print(f"[{i+1}/{len(results)}] 评测题目 {qid}...")
+        judgment = judge_single(question, answer, judge_llm)
+        entry = {"id": qid, "question": question, "answer": answer, **judgment}
         evaluated.append(entry)
         total_score += judgment["score"]
 
@@ -107,7 +195,8 @@ def main():
     parser = argparse.ArgumentParser(description="LLM 裁判评测")
     parser.add_argument("--results", default="eval/results/results_A.jsonl")
     parser.add_argument("--output", default="eval/results/evaluated_A.jsonl")
-    parser.add_argument("--model", default="deepseek-reasoner")
+    parser.add_argument("--questions", default=None, help="当 results 不含 question 时，用于补全题目文本")
+    parser.add_argument("--model", default="kimi-k2-0905-preview")
     parser.add_argument("--provider", default="openai")
     args = parser.parse_args()
 
@@ -118,7 +207,7 @@ def main():
         base_url=os.getenv("OPENAI_API_BASE", "").strip() or None,
         temperature=0.0,
     )
-    evaluate_results(args.results, args.output, judge_llm)
+    evaluate_results(args.results, args.output, judge_llm, questions_path=args.questions)
 
 
 if __name__ == "__main__":
