@@ -4,17 +4,18 @@
 
 # --- 大语言模型 ---
 llm:
-  model: "kimi-k2-0905-preview"
+  # model: "kimi-k2-0905-preview"
+  model: "deepseek-reasoner"
   provider: "openai"
-  temperature: 0
+  temperature: 0.8
   timeout: 60
-  max_tokens: 1000
+  max_tokens: 2000
 
 # 多模态模型（用于图片理解、caption 生成）
 multimodal_llm:
   model: "moonshot-v1-8k"
   provider: "openai"
-  temperature: 0.1
+  temperature: 0.8
   timeout: 60
   max_tokens: 1000
 
@@ -40,7 +41,14 @@ chunking:
 
 # --- 检索参数 ---
 retrieval:
-  search_k: 8
-  rerank_top_n: 8
+  # 粗排候选：与 vector_top_k 取 max 后作为向量召回条数，供精排从更大池子里选真相关段
+  search_k: 15
+  rerank_top_n: 2
   use_rerank: false
-  rag_relevance_threshold: 0.41
+  flashrank_model: "ms-marco-MiniLM-L-12-v2"
+  flashrank_cache_dir: "./models/flashrank"
+  rag_relevance_threshold: 0.4
+  use_hybrid_bm25: true
+  vector_top_k: 6
+  bm25_top_k: 5
+  rag_max_context_documents: 10

@@ -6,7 +6,7 @@
 import os
 import re
 import yaml
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
@@ -16,6 +16,9 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from src.utils import format_docs, postprocess_answer, log_retrieved_docs
 from src.retrieval.text_retriever import build_text_retriever
+from src.retrieval.manual_source_rules import (
+    filter_documents_by_manual_source,
+)
 from src.retrieval.multimodal_retriever import MultimodalRetriever
 from src.agent.chain_of_thought import decompose_question, merge_answers
 from src.agent.hallucination import check_grounding, LOW_CONFIDENCE_DISCLAIMER
@@ -75,15 +78,30 @@ class CustomerServiceAgent:
         )
 
         retrieval_cfg = config["retrieval"]
+        data_cfg = config.get("data") or {}
+        chunks_path = data_cfg.get("chunks_output")
+        if chunks_path:
+            chunks_path = os.path.expandvars(chunks_path)
+        fr_cache = retrieval_cfg.get("flashrank_cache_dir")
+        if fr_cache:
+            fr_cache = os.path.expandvars(str(fr_cache))
         self.text_retriever = build_text_retriever(
             self.vector_store,
             search_k=retrieval_cfg["search_k"],
             rerank_top_n=retrieval_cfg["rerank_top_n"],
             use_rerank=retrieval_cfg["use_rerank"],
+            use_hybrid_bm25=bool(retrieval_cfg.get("use_hybrid_bm25", False)),
+            vector_top_k=int(retrieval_cfg.get("vector_top_k", 4)),
+            bm25_top_k=int(retrieval_cfg.get("bm25_top_k", 4)),
+            chunks_jsonl_path=chunks_path,
+            flashrank_model=retrieval_cfg.get("flashrank_model"),
+            flashrank_cache_dir=fr_cache,
         )
         self.rag_relevance_threshold = float(
             retrieval_cfg.get("rag_relevance_threshold", 0.40)
         )
+        cap = retrieval_cfg.get("rag_max_context_documents")
+        self.rag_max_context_documents = int(cap) if cap is not None else None
 
         self.multimodal_retriever = MultimodalRetriever(
             text_retriever=self.text_retriever,
@@ -149,6 +167,8 @@ class CustomerServiceAgent:
             docs = self.multimodal_retriever.retrieve(sub_q)
             pre_filter_n = len(docs)
             docs = self._filter_docs_above_rag_threshold(docs)
+            docs = filter_documents_by_manual_source(question, docs)
+            docs = self._limit_rag_context_documents(docs)
             log_retrieved_docs(
                 sub_q,
                 docs,
@@ -196,20 +216,45 @@ class CustomerServiceAgent:
         text_with_pic, image_ids = postprocess_answer(raw_answer)
         return text_with_pic, image_ids
 
+    @staticmethod
+    def _retrieval_score_for_threshold(doc: Document) -> Optional[float]:
+        """精排后优先用粗排分（retrieval_score）做阈值，避免归一化精排分与 0.4 阈值不对齐。"""
+        m = doc.metadata or {}
+        rs = m.get("retrieval_score")
+        if rs is not None:
+            try:
+                return float(rs)
+            except (TypeError, ValueError):
+                pass
+        rv = m.get("relevance_score")
+        if rv is not None:
+            try:
+                return float(rv)
+            except (TypeError, ValueError):
+                pass
+        return None
+
     def _filter_docs_above_rag_threshold(self, docs: List[Document]) -> List[Document]:
-        """仅保留 relevance_score 严格大于 rag_relevance_threshold 的片段供 RAG 使用。"""
+        """仅保留粗排分严格大于 rag_relevance_threshold 的片段（有 retrieval_score 时以它为准）。"""
         thr = self.rag_relevance_threshold
         kept: List[Document] = []
         for doc in docs:
-            raw = doc.metadata.get("relevance_score")
+            raw = self._retrieval_score_for_threshold(doc)
             if raw is None:
                 continue
-            try:
-                if float(raw) > thr:
-                    kept.append(doc)
-            except (TypeError, ValueError):
-                continue
+            if raw > thr:
+                kept.append(doc)
         return kept
+
+    def _limit_rag_context_documents(self, docs: List[Document]) -> List[Document]:
+        """
+        截取进入 prompt 的条数；保持检索器返回顺序（精排序），不再按分数重排，
+        避免把「向量高分但非最贴题」的段重新顶到最前。
+        """
+        cap = self.rag_max_context_documents
+        if cap is None or cap <= 0:
+            return docs
+        return docs[:cap]
 
     def _fallback_customer_service_answer(self, question: str) -> str:
         """说明书缺少依据时，切换到商家客服口径回答。"""
