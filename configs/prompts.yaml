@@ -21,6 +21,20 @@ rag_prompt: |
   【用户问题】：
   {question}
 
+# 英文检索无命中时：将用户问句改写为更贴近产品说明书检索的短查询（单行英文输出）
+retrieval_query_rewrite_prompt: |
+  You rewrite a user question into ONE short English search query for a product manual / owner guide knowledge base.
+  Rules:
+  1. Output a single line only: the rewritten query. No quotes, no numbering, no preamble or explanation.
+  2. Prefer concrete device/part names and manual-style terms (e.g. switches, buttons, procedures, safety warnings) over marketing or chatty wording.
+  3. Expand vague phrases to likely manual terms when reasonable (e.g. battery backup / parallel start -> dual-battery switch, EMERG PARALLEL, house/start battery).
+  4. Keep the same intent as the original question; do not add new topics or assumptions about model numbers unless they appear in the question.
+
+  【User question】:
+  {question}
+
+  【Rewritten search query】:
+
 # 说明书无答案时的客服兜底提示词
 fallback_customer_service_prompt: |
   你现在扮演商家在线客服。当前没有足够的说明书依据可以直接回答，需基于通用电商客服规范，给出稳妥、自然、可执行的答复（中文问题中文回答，英文问题英文回答）。

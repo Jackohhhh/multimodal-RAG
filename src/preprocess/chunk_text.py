@@ -29,6 +29,16 @@ _SECTION_BOUNDARY = re.compile(
 # 仅含图片占位、无说明正文的段（预处理常见），并入相邻段以免检索碎片
 _ORPHAN_IMG_BLOCK = re.compile(r"^(\s*\[IMG:[^\]]+\]\s*)+$")
 
+def _chunk_has_excessive_dot_run(text: str, max_allowed_consecutive: int = 10) -> bool:
+    """
+    是否存在「超过 max_allowed_consecutive 个」连续英文句号 ``.``。
+    默认 10 即连续 11 个及以上 ``.`` 时返回 True（整块应丢弃）。
+    """
+    n = int(max_allowed_consecutive)
+    if n < 1:
+        return False
+    return bool(re.search(rf"\.{{{n + 1},}}", text))
+
 
 def _merge_orphan_img_sections(sections: List[str]) -> List[str]:
     """将「只有 [IMG:…] 行」的短段合并进下一段；若段末仍有悬空图块则并回上一段。"""
@@ -142,6 +152,35 @@ def _should_relocate_leading_imgs_after_line(first_meaningful_line: str) -> bool
     if re.match(r"^\d+\s*[A-Za-z]", s):
         return True
     return False
+
+
+def _move_leading_img_lines_to_chunk_end(text: str) -> str:
+    """
+    将块首连续若干行 [IMG:…] 移到该块末尾（正文优先），便于向量检索以首句语义为主，
+    同时块内仍保留全部 [IMG:] 供 RAG 提示词引用。metadata.related_images 由全文正则提取，与顺序无关。
+    """
+    lines = text.splitlines()
+    lead_imgs: List[str] = []
+    i = 0
+    while i < len(lines):
+        t = lines[i].strip()
+        if not t:
+            i += 1
+            continue
+        if t.startswith("[IMG:"):
+            lead_imgs.append(lines[i])
+            i += 1
+        else:
+            break
+    if not lead_imgs:
+        return text
+    rest_lines = lines[i:]
+    if not any(x.strip() for x in rest_lines):
+        return text
+    rest = "\n".join(rest_lines).rstrip()
+    tail = "\n".join(lead_imgs).strip()
+    # 只 rstrip 全文，避免 strip 吃掉正文第一行的前导空格/缩进
+    return f"{rest}\n\n{tail}".rstrip()
 
 
 def _relocate_leading_img_lines_to_previous(chunks: List[str]) -> List[str]:
@@ -264,6 +303,9 @@ def chunk_marked_text(
     chunk_size: int = 800,
     chunk_overlap: int = 150,
     separators: Optional[List[str]] = None,
+    *,
+    strip_dot_leader_lines: bool = True,
+    dot_run_max_allowed: int = 10,
 ) -> List["Document"]:
     """
     切分含 [IMG:xxx] 标记的文本。
@@ -271,6 +313,8 @@ def chunk_marked_text(
     策略：先按章节边界硬切（见 ``_split_by_headers``），合并孤立图块与
     ``# A.``/``# B.`` 等子节，并将「段首图 + 下接 # 标题或英文编号步骤」的图行移回上一段末尾，
     再合并「仅含 # 标题行」的孤立短块；仅对超长段递归切分，并对子块再次合并孤儿图、图行回移与标题合并。
+    最后将「段首连续 [IMG:]、后接正文」的图行挪到块末，减轻英文手册中图标记挤在检索文本开头的问题。
+    可选：若块内出现「超过 dot_run_max_allowed 个」连续 ``.``（目录引导线等），整段丢弃。
     每个 chunk 的 metadata 自动包含该 chunk 内出现的图片ID列表。
     """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -300,6 +344,21 @@ def chunk_marked_text(
     all_chunks = _merge_orphan_img_sections(all_chunks)
     all_chunks = _relocate_leading_img_lines_to_previous(all_chunks)
     all_chunks = _merge_heading_only_stacks_forward(all_chunks)
+    all_chunks = [_move_leading_img_lines_to_chunk_end(s) for s in all_chunks]
+
+    if strip_dot_leader_lines:
+        kept: List[str] = []
+        dropped_dot = 0
+        for s in all_chunks:
+            if _chunk_has_excessive_dot_run(s, max_allowed_consecutive=dot_run_max_allowed):
+                dropped_dot += 1
+                continue
+            kept.append(s)
+        if dropped_dot:
+            print(
+                f"  [{source}] 含连续句点超过 {dot_run_max_allowed} 个的片段整段丢弃: {dropped_dot} 个"
+            )
+        all_chunks = kept
 
     documents = []
     for i, chunk_text in enumerate(all_chunks):

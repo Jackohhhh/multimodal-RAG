@@ -51,11 +51,14 @@ def cmd_preprocess(args):
         print(f"  {doc_info['filename']}: {pic_count} 个 <PIC> 已映射为 [IMG:id]")
 
         # --- 步骤 3: 切分（保留 [IMG:id] 标记）---
+        chunk_cfg = config.get("chunking") or {}
         chunks = chunk_marked_text(
             marked_text=marked_text,
             source=doc_info["filename"],
-            chunk_size=config["chunking"]["chunk_size"],
-            chunk_overlap=config["chunking"]["chunk_overlap"],
+            chunk_size=chunk_cfg["chunk_size"],
+            chunk_overlap=chunk_cfg["chunk_overlap"],
+            strip_dot_leader_lines=bool(chunk_cfg.get("strip_dot_leader_lines", True)),
+            dot_run_max_allowed=int(chunk_cfg.get("dot_run_max_allowed", 10)),
         )
         all_chunks.extend(chunks)
 

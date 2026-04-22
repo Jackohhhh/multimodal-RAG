@@ -1,7 +1,8 @@
 """
-根据用户问题过滤检索片段的 source：
+根据用户问题过滤检索片段的 source（专一性）：
 - 以英文为主的问题：仅保留「汇总英文手册」来源；
-- 中文问题：须命中手册对应产品关键词，否则全部丢弃；保留的片段 source 须包含对应手册文件名子串。
+- 中文问题：若命中产品关键词，仅保留 source 含对应手册子串的片段；
+- 中文问题：若未命中任何产品关键词，不做 source 限制，保留检索器返回的全部片段。
 """
 from __future__ import annotations
 
@@ -61,10 +62,10 @@ def is_mainly_english_query(text: str) -> bool:
 
 def required_source_substrings(question: str) -> Tuple[str, ...]:
     """
-    返回允许的 source 子串。
+    返回允许的 source 子串；空元组表示「不按 source 过滤」。
     - 英文问题 -> (\"汇总英文手册\",)；
     - 中文命中产品词 -> 命中的若干子串（文档 source 包含其一即可）；
-    - 未命中任何产品词 -> 空元组（调用方应丢弃全部片段）。
+    - 中文未命中任何产品词 -> 空元组。
     """
     q = question or ""
     if is_mainly_english_query(q):
@@ -82,10 +83,10 @@ def required_source_substrings(question: str) -> Tuple[str, ...]:
 def filter_documents_by_manual_source(
     question: str, documents: Sequence[Document]
 ) -> List[Document]:
-    """无产品命中时返回空列表；否则只保留 source 命中允许子串的文档。"""
+    """有明确 source 约束时只保留匹配文档；无约束时原样返回全部检索结果。"""
     required = required_source_substrings(question)
     if len(required) == 0:
-        return []
+        return list(documents)
     out: List[Document] = []
     for doc in documents:
         src = (doc.metadata.get("source") or "") if doc.metadata else ""

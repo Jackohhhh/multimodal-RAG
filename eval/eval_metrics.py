@@ -200,13 +200,24 @@ def main():
     parser.add_argument("--provider", default="openai")
     args = parser.parse_args()
 
-    judge_llm = init_chat_model(
-        args.model,
-        model_provider=args.provider,
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE", "").strip() or None,
-        temperature=0.0,
-    )
+    prov = (args.provider or "openai").strip().lower()
+    if prov == "google_genai":
+        judge_llm = init_chat_model(
+            args.model,
+            model_provider=args.provider,
+            api_key=os.getenv("GOOGLE_API_KEY")
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("OPENAI_API_KEY"),
+            temperature=0.0,
+        )
+    else:
+        judge_llm = init_chat_model(
+            args.model,
+            model_provider=args.provider,
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_API_BASE", "").strip() or None,
+            temperature=0.0,
+        )
     evaluate_results(args.results, args.output, judge_llm, questions_path=args.questions)
 
 

@@ -3,9 +3,11 @@
 # ============================================================
 
 # --- 大语言模型 ---
+# 使用 Google Gemini：provider 设为 google_genai，model 如 gemini-2.0-flash / gemini-2.5-flash；
+# 在 set_env.sh 或环境中 export GOOGLE_API_KEY="..."（或 GEMINI_API_KEY）。勿设置 OPENAI_API_BASE。
 llm:
   # model: "kimi-k2-0905-preview"
-  model: "deepseek-reasoner"
+  model: "deepseek-chat"
   provider: "openai"
   temperature: 0.8
   timeout: 60
@@ -38,6 +40,9 @@ vector_store:
 chunking:
   chunk_size: 800
   chunk_overlap: 150
+  # 块内一旦出现「超过 dot_run_max_allowed 个」连续英文 `.`，整段丢弃（目录引导线等）
+  strip_dot_leader_lines: true
+  dot_run_max_allowed: 10
 
 # --- 检索参数 ---
 retrieval:
@@ -51,4 +56,6 @@ retrieval:
   use_hybrid_bm25: true
   vector_top_k: 6
   bm25_top_k: 5
-  rag_max_context_documents: 10
+  rag_max_context_documents: 6
+  # 英文为主的问题：不调用客服兜底模型；无检索/幻觉等仍用 RAG 主提示词 + 主 LLM
+  english_rag_only_no_customer_service_llm: true
