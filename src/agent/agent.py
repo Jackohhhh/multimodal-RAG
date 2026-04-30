@@ -101,6 +101,9 @@ class CustomerServiceAgent:
         self.rag_relevance_threshold = float(
             retrieval_cfg.get("rag_relevance_threshold", 0.40)
         )
+        self.rag_fallback_relevance_threshold = float(
+            retrieval_cfg.get("rag_fallback_relevance_threshold", 0.25)
+        )
         cap = retrieval_cfg.get("rag_max_context_documents")
         self.rag_max_context_documents = int(cap) if cap is not None else None
         self.english_rag_only_no_customer_service_llm = bool(
@@ -134,6 +137,12 @@ class CustomerServiceAgent:
         self.use_query_rewrite = bool(
             retrieval_cfg.get("use_query_rewrite", False)
         )
+        raw_rewrite_langs = retrieval_cfg.get("query_rewrite_languages", ["zh"])
+        if isinstance(raw_rewrite_langs, str):
+            raw_rewrite_langs = [raw_rewrite_langs]
+        self.query_rewrite_languages = {
+            str(x).strip().lower() for x in raw_rewrite_langs
+        }
 
     def _init_llm(self, llm_config: dict):
         provider = (llm_config.get("provider") or "openai").strip().lower()
@@ -246,11 +255,9 @@ class CustomerServiceAgent:
                 if retrieval_queries is not None
                 else sub_q
             )
-            docs = self._retrieve_with_rewrite(rq)
-            pre_filter_n = len(docs)
-            docs = self._filter_docs_above_rag_threshold(docs)
-            docs = filter_documents_by_manual_source(question, docs)
-            docs = self._limit_rag_context_documents(docs)
+            raw_docs = self._retrieve_with_rewrite(rq, original_question=question)
+            pre_filter_n = len(raw_docs)
+            docs = self._select_docs_for_rag(question, raw_docs)
             log_retrieved_docs(
                 rq,
                 docs,
@@ -311,10 +318,15 @@ class CustomerServiceAgent:
         first = first.strip("\"'""''")
         return first
 
-    def _retrieve_with_rewrite(self, query: str) -> List[Document]:
-        """当 use_query_rewrite 开启时，用扩写 query 与原 query 双路检索并合并去重。"""
+    def _retrieve_with_rewrite(
+        self,
+        query: str,
+        *,
+        original_question: Optional[str] = None,
+    ) -> List[Document]:
+        """按语言策略检索：原 query + 可选扩写 query，随后合并去重。"""
         docs_original = self.multimodal_retriever.retrieve(query)
-        if not self.use_query_rewrite or self.query_expand_prompt is None:
+        if not self._should_use_query_rewrite(original_question or query):
             return docs_original
 
         expanded = self._expand_query(query)
@@ -342,6 +354,15 @@ class CustomerServiceAgent:
         )
         return merged
 
+    def _should_use_query_rewrite(self, question: str) -> bool:
+        """控制 query 扩写适用语言；英文扩写在当前数据上容易带偏，默认只开中文。"""
+        if not self.use_query_rewrite or self.query_expand_prompt is None:
+            return False
+        if "all" in self.query_rewrite_languages:
+            return True
+        lang = "en" if is_mainly_english_query(question or "") else "zh"
+        return lang in self.query_rewrite_languages
+
     def _rewrite_retrieval_query(self, question: str) -> str:
         """将用户问句改写为更适合检索的英文短查询（单行）。"""
         chain = self.retrieval_query_rewrite_prompt | self.llm | StrOutputParser()
@@ -355,8 +376,12 @@ class CustomerServiceAgent:
     @staticmethod
     def _is_exact_rag_miss_message(text: str) -> bool:
         """合并后的 RAG 输出是否仅为提示词规定的无命中句（触发英文 query 重写）。"""
-        normalized = re.sub(r"\s+", "", (text or "").strip())
-        return normalized == "未找到相关信息"
+        normalized = re.sub(r"\s+", "", (text or "").strip()).lower()
+        return normalized in {
+            "未找到相关信息",
+            "norelevantinformationfound.",
+            "norelevantinformationfound",
+        }
 
     @staticmethod
     def _same_query_for_retrieval(a: str, b: str) -> bool:
@@ -383,6 +408,25 @@ class CustomerServiceAgent:
             except (TypeError, ValueError):
                 pass
         return None
+
+    def _select_docs_for_rag(self, question: str, docs: List[Document]) -> List[Document]:
+        """
+        进入 RAG 前的筛选：
+        1. 正常路径：先按主阈值过滤，再按产品 source 过滤；
+        2. 兜底路径：若主阈值后没有同产品片段，则在同产品源内放宽阈值，减少误报“未找到”。
+        """
+        thresholded = self._filter_docs_above_rag_threshold(docs)
+        selected = filter_documents_by_manual_source(question, thresholded)
+        if selected:
+            return self._limit_rag_context_documents(selected)
+
+        source_filtered = filter_documents_by_manual_source(question, docs)
+        relaxed: List[Document] = []
+        for doc in source_filtered:
+            raw = self._retrieval_score_for_threshold(doc)
+            if raw is None or raw > self.rag_fallback_relevance_threshold:
+                relaxed.append(doc)
+        return self._limit_rag_context_documents(relaxed)
 
     def _filter_docs_above_rag_threshold(self, docs: List[Document]) -> List[Document]:
         """仅保留粗排分严格大于 rag_relevance_threshold 的片段（有 retrieval_score 时以它为准）。"""
@@ -462,8 +506,16 @@ class CustomerServiceAgent:
             "没有相关信息",
             "无法找到相关信息",
             "无法从上下文中找到",
+            "norelevantinformationfound",
+            "no relevant information found",
+            "cannot find relevant information",
         )
-        return (not normalized) or any(signal in normalized for signal in fallback_signals)
+        normalized_lower = (answer or "").strip().lower()
+        return (
+            not normalized
+            or any(signal in normalized for signal in fallback_signals)
+            or any(signal in normalized_lower for signal in fallback_signals)
+        )
 
     @classmethod
     def _should_use_customer_service_directly(cls, question: str) -> bool:

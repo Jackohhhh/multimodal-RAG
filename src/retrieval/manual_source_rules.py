@@ -1,7 +1,7 @@
 """
 根据用户问题过滤检索片段的 source（专一性）：
-- 以英文为主的问题：仅保留「汇总英文手册」来源；
-- 中文问题：若命中产品关键词，仅保留 source 含对应手册子串的片段；
+- 中英文问题：若命中产品关键词，优先仅保留对应手册条目的片段；
+- 英文问题：若未命中具体产品关键词，则退回「汇总英文手册」来源；
 - 中文问题：若未命中任何产品关键词，不做 source 限制，保留检索器返回的全部片段。
 """
 from __future__ import annotations
@@ -37,7 +37,112 @@ KEYWORD_SOURCE_PAIRS: Tuple[Tuple[str, str], ...] = tuple(
             ("头显", "VR头显手册"),
             ("VR头显", "VR头显手册"),
             ("汇总英文", "汇总英文手册"),
-            # 英文手册各条目：产品关键词 → source 后缀子串
+            # 英文手册各条目：产品关键词/常见问法 → source 后缀子串
+            ("over-the-range microwave", "Microwave_Oven"),
+            ("multi-use pressure cooker and air fryer", "Pressure_Cooker_Air_Fryer"),
+            ("pressure cooker and air fryer", "Pressure_Cooker_Air_Fryer"),
+            ("dual-mode virtual wall barrier", "Vacuum_Cleaner"),
+            ("dual mode virtual wall barrier", "Vacuum_Cleaner"),
+            ("virtual wall barrier", "Vacuum_Cleaner"),
+            ("front caster wheel", "Vacuum_Cleaner"),
+            ("full bin sensors", "Vacuum_Cleaner"),
+            ("charging contacts", "Vacuum_Cleaner"),
+            ("robot anatomy", "Vacuum_Cleaner"),
+            ("home base", "Vacuum_Cleaner"),
+            ("extractors", "Vacuum_Cleaner"),
+            ("side brush", "Vacuum_Cleaner"),
+            ("T-rail", "Network_Camera"),
+            ("t-rail", "Network_Camera"),
+            ("power the camera", "Network_Camera"),
+            ("camera battery", "Canon_Camera"),
+            ("date/time battery", "Canon_Camera"),
+            ("household power socket", "Canon_Camera"),
+            ("off-center subject", "Canon_Camera"),
+            ("eyepiece cover", "Canon_Camera"),
+            ("AF Mode", "Canon_Camera"),
+            ("CP direct", "Canon_Camera"),
+            ("CF card", "Canon_Camera"),
+            ("Mode Dial", "Canon_Camera"),
+            ("lens", "Canon_Camera"),
+            ("snowmobile", "Motorcycle"),
+            ("V-Belt", "Motorcycle"),
+            ("v-belt", "Motorcycle"),
+            ("brake lever", "Motorcycle"),
+            ("brake button", "Motorcycle"),
+            ("throttle cable", "Motorcycle"),
+            ("spark plug", "Motorcycle"),
+            ("jetski", "WaveRunner_2005"),
+            ("jet ski", "WaveRunner_2005"),
+            ("watercraft", "WaveRunner_2005"),
+            ("Quick Shift Trim System", "WaveRunner_2005"),
+            ("QSTS", "WaveRunner_2005"),
+            ("fuel meter", "WaveRunner_2005"),
+            ("hour meter", "WaveRunner_2005"),
+            ("filler cap", "WaveRunner_2005"),
+            ("battery conversion", "Boat_210FSH"),
+            ("battery switch", "Boat_210FSH"),
+            ("storage compartments", "Boat_210FSH"),
+            ("battery compartment", "Boat_210FSH"),
+            ("anchor light", "Boat_210FSH"),
+            ("jet wash", "Boat_210FSH"),
+            ("water supply", "Boat_210FSH"),
+            ("bimini top", "Boat_210FSH"),
+            ("bilge pump", "Boat_210FSH"),
+            ("livewell", "Boat_210FSH"),
+            ("swim platform", "Boat_210FSH"),
+            ("boat controller", "Boat_210FSH"),
+            ("trip screen", "Boat_210FSH"),
+            ("fire extinguisher", "Boat_210FSH"),
+            ("throttle-cable", "Boat_210FSH"),
+            ("steering system", "Boat_210FSH"),
+            ("cooling system", "Boat_210FSH"),
+            ("engine oil level", "Boat_210FSH"),
+            ("boat", "Boat_210FSH"),
+            ("ship", "Boat_210FSH"),
+            ("sailing", "Boat_210FSH"),
+            ("coffee machine", "Espresso_Machine"),
+            ("coffee maker", "Espresso_Machine"),
+            ("factory settings", "Espresso_Machine"),
+            ("energy saving", "Espresso_Machine"),
+            ("water volume", "Espresso_Machine"),
+            ("empty the system", "Espresso_Machine"),
+            ("airfryer", "Air_Fryer_Philips"),
+            ("air fryer", "Air_Fryer_Philips"),
+            ("earphones", "ANC_Earphones"),
+            ("earbuds", "ANC_Earphones"),
+            ("sound system", "ANC_Earphones"),
+            ("bluetooth", "ANC_Earphones"),
+            ("eReader", "Ebook_Device"),
+            ("e-book reader", "Ebook_Device"),
+            ("Browser History", "Ebook_Device"),
+            ("photo viewer", "Ebook_Device"),
+            ("fax", "Power_Tool_Safety"),
+            ("LP Tank", "Outdoor_Grill"),
+            ("regulator", "Outdoor_Grill"),
+            ("indirect cooking", "Outdoor_Grill"),
+            ("assembly process", "Outdoor_Grill"),
+            ("landline", "Answering_Machine"),
+            ("base station", "Answering_Machine"),
+            ("handset", "Answering_Machine"),
+            ("LED indicator", "Answering_Machine"),
+            ("lawn mower", "Outdoor_Engine_Generator"),
+            ("roll bar", "Outdoor_Engine_Generator"),
+            ("height of cut", "Outdoor_Engine_Generator"),
+            ("mower belt", "Outdoor_Engine_Generator"),
+            ("rear-shock", "Outdoor_Engine_Generator"),
+            ("motherboard", "Computer_Manual"),
+            ("PCI Express", "Computer_Manual"),
+            ("BIOS", "Computer_Manual"),
+            ("RAID", "Computer_Manual"),
+            ("CPU", "Computer_Manual"),
+            ("TPM", "Computer_Manual"),
+            ("television", "Color_Television"),
+            ("TV", "Color_Television"),
+            ("DVD player", "Color_Television"),
+            ("Closed Captions", "Color_Television"),
+            ("captions", "Color_Television"),
+            ("outdoor antenna", "Color_Television"),
+            ("toothbrush", "Electric_Toothbrush"),
             ("Canon Camera", "Canon_Camera"),
             ("Espresso", "Espresso_Machine"),
             ("espresso", "Espresso_Machine"),
@@ -92,20 +197,24 @@ def is_mainly_english_query(text: str) -> bool:
 def required_source_substrings(question: str) -> Tuple[str, ...]:
     """
     返回允许的 source 子串；空元组表示「不按 source 过滤」。
-    - 英文问题 -> (\"汇总英文手册\",)；
-    - 中文命中产品词 -> 命中的若干子串（文档 source 包含其一即可）；
-    - 中文未命中任何产品词 -> 空元组。
+    - 中英文命中产品词 -> 命中的若干子串（文档 source 包含其一即可）；
+    - 英文未命中产品词 -> (\"汇总英文手册\",)；
+    - 中文未命中产品词 -> 空元组。
     """
     q = question or ""
-    if is_mainly_english_query(q):
-        return (_ENGLISH_SUMMARY_SOURCE,)
-
     normalized = re.sub(r"\s+", "", q)
+    q_lower = q.lower()
+    normalized_lower = normalized.lower()
     seen: List[str] = []
     for kw, src_sub in KEYWORD_SOURCE_PAIRS:
-        if kw in normalized or kw in q:
+        kw_lower = kw.lower()
+        if kw in normalized or kw in q or kw_lower in q_lower or kw_lower in normalized_lower:
             if src_sub not in seen:
                 seen.append(src_sub)
+    if seen:
+        return tuple(seen)
+    if is_mainly_english_query(q):
+        return (_ENGLISH_SUMMARY_SOURCE,)
     return tuple(seen)
 
 

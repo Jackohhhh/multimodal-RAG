@@ -9,7 +9,7 @@ llm:
   # model: "kimi-k2-0905-preview"
   model: "deepseek-v4-flash"
   provider: "openai"
-  temperature: 0.8
+  temperature: 0.2
   timeout: 60
   max_tokens: 2000
 
@@ -17,7 +17,7 @@ llm:
 multimodal_llm:
   model: "moonshot-v1-8k"
   provider: "openai"
-  temperature: 0.8
+  temperature: 0.2
   timeout: 60
   max_tokens: 1000
 
@@ -47,17 +47,21 @@ chunking:
 # --- 检索参数 ---
 retrieval:
   # 粗排候选：与 vector_top_k 取 max 后作为向量召回条数，供精排从更大池子里选真相关段
-  search_k: 15
-  rerank_top_n: 10
+  search_k: 25
+  rerank_top_n: 12
   use_rerank: false
   flashrank_model: "ms-marco-MiniLM-L-12-v2"
   flashrank_cache_dir: "./models/flashrank"
   rag_relevance_threshold: 0.4
+  # 主阈值过滤后无同产品片段时，放宽阈值兜底，减少英文/短问句误报未找到
+  rag_fallback_relevance_threshold: 0.25
   use_hybrid_bm25: true
-  vector_top_k: 6
-  bm25_top_k: 5
-  rag_max_context_documents: 6
+  vector_top_k: 10
+  bm25_top_k: 8
+  rag_max_context_documents: 8
   # 英文为主的问题：不调用客服兜底模型；无检索/幻觉等仍用 RAG 主提示词 + 主 LLM
   english_rag_only_no_customer_service_llm: true
   # 每个问题都先用 LLM 将 query 改写为详细扩展查询，再与原 query 双路检索合并
   use_query_rewrite: true
+  # 英文扩写在当前数据上容易把产品带偏；中文保留扩写增强
+  query_rewrite_languages: ["zh"]
