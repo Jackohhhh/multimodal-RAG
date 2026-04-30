@@ -127,6 +127,13 @@ class CustomerServiceAgent:
         self.retrieval_query_rewrite_prompt = (
             ChatPromptTemplate.from_template(rw_tpl) if rw_tpl else None
         )
+        expand_tpl = prompts.get("query_expand_prompt")
+        self.query_expand_prompt = (
+            ChatPromptTemplate.from_template(expand_tpl) if expand_tpl else None
+        )
+        self.use_query_rewrite = bool(
+            retrieval_cfg.get("use_query_rewrite", False)
+        )
 
     def _init_llm(self, llm_config: dict):
         provider = (llm_config.get("provider") or "openai").strip().lower()
@@ -239,7 +246,7 @@ class CustomerServiceAgent:
                 if retrieval_queries is not None
                 else sub_q
             )
-            docs = self.multimodal_retriever.retrieve(rq)
+            docs = self._retrieve_with_rewrite(rq)
             pre_filter_n = len(docs)
             docs = self._filter_docs_above_rag_threshold(docs)
             docs = filter_documents_by_manual_source(question, docs)
@@ -291,6 +298,49 @@ class CustomerServiceAgent:
 
             sub_answers.append(response)
         return sub_answers
+
+    def _expand_query(self, question: str) -> str:
+        """用 LLM 将问题改写为详细的扩展检索查询（单行输出）。"""
+        if self.query_expand_prompt is None:
+            return ""
+        chain = self.query_expand_prompt | self.llm | StrOutputParser()
+        out = chain.invoke({"question": question}).strip()
+        if not out:
+            return ""
+        first = out.splitlines()[0].strip()
+        first = first.strip("\"'""''")
+        return first
+
+    def _retrieve_with_rewrite(self, query: str) -> List[Document]:
+        """当 use_query_rewrite 开启时，用扩写 query 与原 query 双路检索并合并去重。"""
+        docs_original = self.multimodal_retriever.retrieve(query)
+        if not self.use_query_rewrite or self.query_expand_prompt is None:
+            return docs_original
+
+        expanded = self._expand_query(query)
+        if not expanded or self._same_query_for_retrieval(expanded, query):
+            return docs_original
+
+        docs_expanded = self.multimodal_retriever.retrieve(expanded)
+
+        seen: dict = {}
+        for doc in docs_original + docs_expanded:
+            sig = doc.page_content.strip()
+            if sig not in seen:
+                seen[sig] = doc
+            else:
+                existing = seen[sig]
+                existing_score = self._retrieval_score_for_threshold(existing) or 0.0
+                new_score = self._retrieval_score_for_threshold(doc) or 0.0
+                if new_score > existing_score:
+                    seen[sig] = doc
+
+        merged = sorted(
+            seen.values(),
+            key=lambda d: self._retrieval_score_for_threshold(d) or 0.0,
+            reverse=True,
+        )
+        return merged
 
     def _rewrite_retrieval_query(self, question: str) -> str:
         """将用户问句改写为更适合检索的英文短查询（单行）。"""

@@ -5,20 +5,35 @@ from typing import List, Tuple
 from langchain_core.documents import Document
 
 
+def _friendly_source_label(source: str) -> str:
+    """
+    将内部 source 路径转换为对大模型友好的简短标签。
+    例：'汇总英文手册.txt#Canon_Camera' → 'Canon_Camera'
+        '相机手册.txt'                  → '相机手册'
+    """
+    basename = os.path.basename(source)
+    if "#" in basename:
+        # 多条目 JSONL：取 # 后面的产品名
+        return basename.split("#", 1)[1]
+    # 普通文件：去掉扩展名
+    return os.path.splitext(basename)[0]
+
+
 def format_docs(docs: List[Document]) -> str:
     """
     将检索到的文档格式化为上下文字符串。
     文本中的 [IMG:xxx] 标记保留，大模型可据此引用对应图片。
+    不向大模型暴露检索分数，来源仅以友好标签呈现。
     """
     formatted = []
 
     for i, doc in enumerate(docs):
-        score = doc.metadata.get("relevance_score", 0.0)
-        source = doc.metadata.get("source", "未知")
+        source = doc.metadata.get("source", "")
+        label = _friendly_source_label(source) if source else f"片段{i+1}"
         content = doc.page_content
 
         formatted.append(
-            f"[片段 {i+1} - 来源: {source} - 得分 {score:.2f}]:\n{content}"
+            f"[来源: {label}]:\n{content}"
         )
 
     return "\n\n".join(formatted)

@@ -13,6 +13,15 @@ if TYPE_CHECKING:
 # # 或 ## 后接：空格类 / 全角空格；或直接接标题首字（中文、字母、数字、括号）
 _TITLE_AFTER_HASH = r"#+(?:[\s\u3000]+|[\u4e00-\u9fffA-Za-z0-9（\(])"
 
+# 英文手册全大写标题模式：2+ 个全大写单词（可含 /、- 等）
+# 例：FAVORITE RECIPE / HOLD WARM / EASY COOK / CHILD LOCK
+# 排除：单个全大写词（NOTE / WARNING / CAUTION 等独立词不作分割）
+_ALLCAPS_SECTION_TITLE = (
+    r"(?<!\w)"                                              # 前面不是普通字符
+    r"[A-Z][A-Z0-9/\-]+"                                   # 第一个全大写单词（2+字符）
+    r"(?:\s+[A-Z][A-Z0-9/\-]+)+"                           # 1+ 个后续全大写单词
+)
+
 # 零宽切分：在「新章节」起点前断开（不把正文吞进标题里）
 _SECTION_BOUNDARY = re.compile(
     # 行首 / 全文开头的 Markdown 标题（含 #标题 无空格）
@@ -24,6 +33,10 @@ _SECTION_BOUNDARY = re.compile(
     rf"|(?<=[.!?])(?=\s*{_TITLE_AFTER_HASH})"
     # 行内「…字或标点 # 标题」（吹风机等 <PIC># 连成串、预处理后才断行的情况）
     rf"|(?<=[\u4e00-\u9fff0-9\)）>」』\s])(?=\s*{_TITLE_AFTER_HASH})"
+    # 英文手册全大写节标题（段末标点+双空格后 / 换行后）
+    # 匹配：...cooking.  FAVORITE RECIPE  / 换行开头的 FAVORITE RECIPE
+    rf"|(?<=\.\s\s)(?={_ALLCAPS_SECTION_TITLE})"
+    rf"|(?=\n(?:{_ALLCAPS_SECTION_TITLE})\s)"
 )
 
 # 仅含图片占位、无说明正文的段（预处理常见），并入相邻段以免检索碎片
@@ -31,13 +44,23 @@ _ORPHAN_IMG_BLOCK = re.compile(r"^(\s*\[IMG:[^\]]+\]\s*)+$")
 
 def _chunk_has_excessive_dot_run(text: str, max_allowed_consecutive: int = 10) -> bool:
     """
-    是否存在「超过 max_allowed_consecutive 个」连续英文句号 ``.``。
-    默认 10 即连续 11 个及以上 ``.`` 时返回 True（整块应丢弃）。
+    是否存在「超过 max_allowed_consecutive 个」连续引导点。
+    同时检测：
+    - ASCII 句号 ``.``（U+002E）
+    - Unicode 省略号 ``…``（U+2026，常见于英文手册 OCR 提取的目录引导线）
+    默认 10 即连续 11 个及以上时返回 True（整块应丢弃）。
     """
     n = int(max_allowed_consecutive)
     if n < 1:
         return False
-    return bool(re.search(rf"\.{{{n + 1},}}", text))
+    # ASCII 句号连续
+    if re.search(rf"\.{{{n + 1},}}", text):
+        return True
+    # Unicode 省略号连续（每个 … 视觉上等于 3 个点，3 个 … 即 9 个点，阈值取 3）
+    ellipsis_threshold = max(3, n // 3)
+    if re.search(rf"\u2026{{{ellipsis_threshold},}}", text):
+        return True
+    return False
 
 
 def _merge_orphan_img_sections(sections: List[str]) -> List[str]:
@@ -359,6 +382,19 @@ def chunk_marked_text(
                 f"  [{source}] 含连续句点超过 {dot_run_max_allowed} 个的片段整段丢弃: {dropped_dot} 个"
             )
         all_chunks = kept
+
+    # 过滤极短（< 8 字符）且无图片标记的孤立 chunk（如单独的句号、纯标题行、空白段）
+    kept_nonempty: List[str] = []
+    dropped_short = 0
+    for s in all_chunks:
+        stripped = s.strip()
+        if len(stripped) < 8 and not re.search(r'\[IMG:', stripped):
+            dropped_short += 1
+            continue
+        kept_nonempty.append(s)
+    if dropped_short:
+        print(f"  [{source}] 丢弃极短无效片段: {dropped_short} 个")
+    all_chunks = kept_nonempty
 
     documents = []
     for i, chunk_text in enumerate(all_chunks):

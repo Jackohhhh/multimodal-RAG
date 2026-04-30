@@ -88,10 +88,40 @@ def load_pic_document(file_path: str) -> List[Tuple[str, List[str]]]:
     raise ValueError(f"无法解析文件: {file_path}")
 
 
+# 多条目 JSONL 文件中每条文档的产品名映射。
+# key = 文件名，value = 按行序排列的产品标识（用作 source 后缀）。
+_MULTI_ENTRY_NAMES: Dict[str, List[str]] = {
+    "汇总英文手册.txt": [
+        "Canon_Camera",
+        "Espresso_Machine",
+        "Air_Fryer_Philips",
+        "Boat_210FSH",
+        "WaveRunner_2005",
+        "Power_Tool_Safety",
+        "ANC_Earphones",
+        "Ebook_Device",
+        "Outdoor_Grill",
+        "Motorcycle",
+        "Color_Television",
+        "Vacuum_Cleaner",
+        "Network_Camera",
+        "Electric_Toothbrush",
+        "Washing_Machine",
+        "Pressure_Cooker_Air_Fryer",
+        "Microwave_Oven",
+        "Computer_Manual",
+        "Answering_Machine",
+        "Outdoor_Engine_Generator",
+    ],
+}
+
+
 def load_pic_documents_from_dir(dir_path: str) -> List[Dict]:
     """
     加载目录下所有 [text, [image_ids]] 格式的文档。
     支持 .json 和 .txt 后缀（内容均为 JSON 格式）。
+    多条目 JSONL 文件（含 _MULTI_ENTRY_NAMES 映射的）使用产品名作为 source 后缀，
+    否则回退为 #序号。
     """
     results = []
     supported_exts = {".json", ".txt"}
@@ -104,8 +134,13 @@ def load_pic_documents_from_dir(dir_path: str) -> List[Dict]:
             continue
         try:
             docs = load_pic_document(file_path)
+            name_list = _MULTI_ENTRY_NAMES.get(filename, [])
             for idx, (text, image_ids) in enumerate(docs):
-                suffix = f"#{idx+1}" if len(docs) > 1 else ""
+                if len(docs) > 1:
+                    label = name_list[idx] if idx < len(name_list) else str(idx + 1)
+                    suffix = f"#{label}"
+                else:
+                    suffix = ""
                 doc_name = f"{filename}{suffix}"
                 results.append({
                     "text": text,

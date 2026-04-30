@@ -7,7 +7,7 @@
 # 在 set_env.sh 或环境中 export GOOGLE_API_KEY="..."（或 GEMINI_API_KEY）。勿设置 OPENAI_API_BASE。
 llm:
   # model: "kimi-k2-0905-preview"
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"
   provider: "openai"
   temperature: 0.8
   timeout: 60
@@ -38,8 +38,8 @@ vector_store:
 
 # --- 文本切分 ---
 chunking:
-  chunk_size: 800
-  chunk_overlap: 150
+  chunk_size: 1200
+  chunk_overlap: 100
   # 块内一旦出现「超过 dot_run_max_allowed 个」连续英文 `.`，整段丢弃（目录引导线等）
   strip_dot_leader_lines: true
   dot_run_max_allowed: 10
@@ -48,7 +48,7 @@ chunking:
 retrieval:
   # 粗排候选：与 vector_top_k 取 max 后作为向量召回条数，供精排从更大池子里选真相关段
   search_k: 15
-  rerank_top_n: 2
+  rerank_top_n: 10
   use_rerank: false
   flashrank_model: "ms-marco-MiniLM-L-12-v2"
   flashrank_cache_dir: "./models/flashrank"
@@ -59,3 +59,5 @@ retrieval:
   rag_max_context_documents: 6
   # 英文为主的问题：不调用客服兜底模型；无检索/幻觉等仍用 RAG 主提示词 + 主 LLM
   english_rag_only_no_customer_service_llm: true
+  # 每个问题都先用 LLM 将 query 改写为详细扩展查询，再与原 query 双路检索合并
+  use_query_rewrite: true
