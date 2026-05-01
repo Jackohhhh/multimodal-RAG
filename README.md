@@ -16,6 +16,7 @@
 - [评测与提交](#评测与提交)
 - [故障排查](#故障排查)
 - [开发说明](#开发说明)
+- [开源许可](#license)
 
 ## 核心特性
 
@@ -65,6 +66,8 @@ multimodal-RAG/
 │   └── manuals/                 # 原始说明书数据，内容为 [text, [image_ids]]
 ├── data_processed/
 │   └── chunks/chunks.jsonl      # 预处理后的文本切片
+├── docs/
+│   └── multimodal_pipeline_guide.md
 ├── eval/
 │   ├── questions/               # 批量评测题库，支持 CSV / JSONL
 │   ├── results/                 # 批量答题结果
@@ -92,8 +95,6 @@ multimodal-RAG/
 建议使用 Python 3.10+。
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -104,12 +105,6 @@ pip install -r requirements.txt
 ```bash
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_API_BASE="https://api.deepseek.com/v1"
-```
-
-加载环境变量：
-
-```bash
-source set_env.sh
 ```
 
 ### 3. 构建知识库索引
@@ -123,7 +118,7 @@ python run.py preprocess
 如果是首次使用 `BAAI/bge-m3`，需要确保模型已在本机 Hugging Face 缓存中。项目启动时默认离线加载 Hugging Face 模型；首次下载可临时执行：
 
 ```bash
-HF_HUB_OFFLINE=0 python run.py preprocess
+python run.py preprocess
 ```
 
 ### 4. 启动交互式客服
@@ -146,9 +141,9 @@ python run.py chat --cot --hallucination-check
 
 ```yaml
 llm:
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"
   provider: "openai"
-  temperature: 0.8
+  temperature: 0.2
 
 embeddings:
   model_name: "BAAI/bge-m3"
@@ -160,10 +155,11 @@ vector_store:
 retrieval:
   use_hybrid_bm25: true
   use_rerank: false
-  search_k: 15
-  vector_top_k: 6
-  bm25_top_k: 5
+  search_k: 25
+  vector_top_k: 10
+  bm25_top_k: 8
   rag_relevance_threshold: 0.4
+  rag_fallback_relevance_threshold: 0.25
 ```
 
 常见可调项：
@@ -298,7 +294,6 @@ retrieval:
 
 - OpenAI 兼容模型使用 `OPENAI_API_KEY` 和可选 `OPENAI_API_BASE`。
 - Gemini 使用 `GOOGLE_API_KEY` 或 `GEMINI_API_KEY`，并将 `provider` 配置为 `google_genai`。
-- 不要在公开仓库中提交 `set_env.sh` 或任何真实密钥。
 
 ## 开发说明
 
@@ -309,4 +304,28 @@ retrieval:
 
 ## License
 
-当前仓库尚未声明开源许可证。如需公开发布，建议补充 `LICENSE` 文件并在此处说明授权范围。
+本项目采用 **MIT License** 开源，与上游仓库一致：[multimodal-RAG/LICENSE](https://github.com/Jackohhhh/multimodal-RAG/blob/main/LICENSE)。仓库根目录亦提供 `LICENSE` 文件。
+
+```
+MIT License
+
+Copyright (c) 2026 WuZetong
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
