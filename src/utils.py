@@ -58,8 +58,10 @@ def postprocess_answer(answer: str) -> Tuple[str, List[str]]:
     2. 将 [IMG:xxx] 替换回 <PIC>
     返回: (含<PIC>的文本, 图片ID列表)
     """
-    image_ids = re.findall(r'\[IMG:([^\]]+)\]', answer)
-    text_with_pic = re.sub(r'\n?\[IMG:[^\]]+\]\n?', '<PIC>', answer)
+    cleaned = re.sub(r'\n?\[来源:[^\]]+\]:\n?', '\n', answer or "")
+    image_ids = re.findall(r'\[IMG:([^\]]+)\]', cleaned)
+    text_with_pic = re.sub(r'\n?\[IMG:[^\]]+\]\n?', '<PIC>', cleaned)
+    text_with_pic = re.sub(r'\n{3,}', '\n\n', text_with_pic).strip()
     return text_with_pic, image_ids
 
 
