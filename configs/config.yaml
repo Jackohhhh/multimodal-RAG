@@ -3,15 +3,12 @@
 # ============================================================
 
 # --- 大语言模型 ---
-# 使用 Google Gemini：provider 设为 google_genai，model 如 gemini-2.0-flash / gemini-2.5-flash；
-# 在 set_env.sh 或环境中 export GOOGLE_API_KEY="..."（或 GEMINI_API_KEY）。勿设置 OPENAI_API_BASE。
 llm:
-  # model: "kimi-k2-0905-preview"
   model: "deepseek-v4-flash"
   provider: "openai"
   temperature: 0.2
   timeout: 60
-  max_tokens: 2000
+  max_tokens: 4000
 
 # 多模态模型（用于图片理解、caption 生成）
 multimodal_llm:
@@ -40,7 +37,6 @@ vector_store:
 chunking:
   chunk_size: 1200
   chunk_overlap: 100
-  # 块内一旦出现「超过 dot_run_max_allowed 个」连续英文 `.`，整段丢弃（目录引导线等）
   strip_dot_leader_lines: true
   dot_run_max_allowed: 10
 
@@ -53,15 +49,11 @@ retrieval:
   flashrank_model: "ms-marco-MiniLM-L-12-v2"
   flashrank_cache_dir: "./models/flashrank"
   rag_relevance_threshold: 0.4
-  # 主阈值过滤后无同产品片段时，放宽阈值兜底，减少英文/短问句误报未找到
   rag_fallback_relevance_threshold: 0.25
   use_hybrid_bm25: true
   vector_top_k: 10
   bm25_top_k: 8
   rag_max_context_documents: 8
-  # 英文为主的问题：不调用客服兜底模型；无检索/幻觉等仍用 RAG 主提示词 + 主 LLM
   english_rag_only_no_customer_service_llm: true
-  # 每个问题都先用 LLM 将 query 改写为详细扩展查询，再与原 query 双路检索合并
   use_query_rewrite: true
-  # 英文扩写在当前数据上容易把产品带偏；中文保留扩写增强
   query_rewrite_languages: ["zh"]

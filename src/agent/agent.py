@@ -115,6 +115,9 @@ class CustomerServiceAgent:
         if chunks_path:
             chunks_path = os.path.expandvars(chunks_path)
         self.chunk_documents = self._load_chunk_documents(chunks_path)
+        self.chunk_document_lookup = self._build_chunk_document_lookup(
+            self.chunk_documents
+        )
         fr_cache = retrieval_cfg.get("flashrank_cache_dir")
         if fr_cache:
             fr_cache = os.path.expandvars(str(fr_cache))
@@ -406,12 +409,30 @@ class CustomerServiceAgent:
                     Document(
                         page_content=content,
                         metadata={
+                            "chunk_id": item.get("chunk_id"),
                             "source": source,
                             "related_images": item.get("related_images") or [],
                         },
                     )
                 )
         return docs
+
+    @staticmethod
+    def _build_chunk_document_lookup(
+        docs: List[Document],
+    ) -> dict[tuple[str, int], Document]:
+        lookup: dict[tuple[str, int], Document] = {}
+        for doc in docs:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            chunk_id = meta.get("chunk_id")
+            if not source or chunk_id is None:
+                continue
+            try:
+                lookup[(source, int(chunk_id))] = doc
+            except (TypeError, ValueError):
+                continue
+        return lookup
 
     def _retrieve_matching_section_titles(self, question: str) -> List[Document]:
         """
@@ -548,11 +569,22 @@ class CustomerServiceAgent:
         t = (text or "").lower()
         phrase_rules: Tuple[Tuple[str, str, float], ...] = (
             ("battery conversion", "# battery switches", 30.0),
+            ("delete a single image", "# erasing a single image", 38.0),
+            ("delete a single image", "# erase the image", 34.0),
+            ("erase a single image", "# erasing a single image", 38.0),
+            ("single image from my camera", "# erasing a single image", 38.0),
+            ("camera image on tv", "# connect the camera to the tv", 38.0),
+            ("view the camera image on tv", "# connect the camera to the tv", 38.0),
             ("anchor light", "# anchor light", 28.0),
             ("maintenance setting screen", "# maintenance setting screen", 32.0),
             ("make the boat move forward", "# forward", 32.0),
             ("ready to sail", "# forward", 24.0),
             ("steering system", "# steering system checks", 32.0),
+            ("robot anatomy", "buttons&indicators", 34.0),
+            ("robot anatomy", "bottomview", 30.0),
+            ("vacuum anatomy", "buttons&indicators", 34.0),
+            ("steering system on a snowmobile", "# steering system", 36.0),
+            ("proper way to use the steering system on a snowmobile", "# steering system", 36.0),
             ("connecting the fax", "# connect the product safely", 30.0),
             ("assembly process", "# assembly", 30.0),
             ("start the engine", "starting theengine", 28.0),
@@ -605,10 +637,20 @@ class CustomerServiceAgent:
         additions: List[str] = []
         alias_rules: Tuple[Tuple[str, str], ...] = (
             ("battery conversion", "battery switches START HOUSE EMERG PARALLEL start battery house battery"),
+            ("delete a single image", "erasing a single image erase image erase menu"),
+            ("erase a single image", "erasing a single image erase image erase menu"),
+            ("single image from my camera", "erasing a single image erase image erase menu"),
+            ("camera image on tv", "connect the camera to the tv video cable video in terminal"),
+            ("view the camera image on tv", "connect the camera to the tv video cable video in terminal"),
+            ("viewing the images on a tv", "connect the camera to the tv video cable video in terminal"),
             ("ready to sail", "starting off remote control lever throttle forward"),
             ("make the boat move forward", "starting off remote control lever throttle forward"),
             ("anchor light", "set up removable anchor light socket navigation anchor lights switch"),
             ("steering system", "steering wheel jet thrust nozzle articulating keel remote control lever"),
+            ("robot anatomy", "topview buttons indicators bottomview clean button home base bin release"),
+            ("vacuum anatomy", "topview buttons indicators bottomview clean button home base bin release"),
+            ("proper way to use the steering system on a snowmobile", "ski skirunner steering system handlebar free play"),
+            ("steering system on a snowmobile", "ski skirunner steering system handlebar free play"),
             ("maintenance setting screen", "maintenance setting screen reset hours operation"),
             ("assembly process", "assembly attach locking casters bottom shelf supplied wrench"),
             ("connecting the fax", "connect product safely telephone line cord power cord wall jack"),
@@ -736,6 +778,8 @@ class CustomerServiceAgent:
         source_filtered = filter_documents_by_manual_source(question, docs)
         relaxed = self._filter_docs_above_fallback_threshold(source_filtered)
         candidates = self._merge_doc_lists_preserve_order(selected + relaxed)
+        candidates = self._drop_low_information_docs(candidates)
+        candidates = self._expand_with_adjacent_chunks(question, candidates)
         prioritized = self._prioritize_docs_by_section_intent(question, candidates)
         return self._limit_rag_context_documents(prioritized)
 
@@ -797,7 +841,110 @@ class CustomerServiceAgent:
             ),
             reverse=True,
         )
+        if re.search(r"delete|erase|删除", question or "", re.IGNORECASE):
+            ordered = self._prioritize_docs_matching_titles(
+                preferred + rest,
+                r"erasing images|erasing a single image|select the image to be erased|erase the image",
+            )
+            if ordered:
+                return ordered
+        if re.search(r"assembly|装配|组装", question or "", re.IGNORECASE):
+            return self._prioritize_numbered_assembly_steps(preferred + rest)
         return preferred + rest
+
+    def _prioritize_docs_matching_titles(
+        self, docs: List[Document], title_pattern: str
+    ) -> Optional[List[Document]]:
+        matched = [
+            doc for doc in docs
+            if re.search(title_pattern, doc.page_content or "", re.IGNORECASE)
+        ]
+        if not matched:
+            return None
+        matched_sigs = {doc.page_content.strip() for doc in matched}
+        rest = [doc for doc in docs if doc.page_content.strip() not in matched_sigs]
+        return self._sort_docs_by_source_chunk_order(matched) + rest
+
+    def _prioritize_numbered_assembly_steps(
+        self, docs: List[Document]
+    ) -> List[Document]:
+        step_docs = [
+            doc for doc in docs
+            if re.match(r"\s*#\s*(assembly|[123]\b)", doc.page_content or "", re.IGNORECASE)
+        ]
+        if not step_docs:
+            return docs
+        step_sigs = {doc.page_content.strip() for doc in step_docs}
+        rest = [doc for doc in docs if doc.page_content.strip() not in step_sigs]
+        return self._sort_docs_by_source_chunk_order(step_docs) + rest
+
+    def _drop_low_information_docs(self, docs: List[Document]) -> List[Document]:
+        """剔除只有封面/产品名/单张图的片段，避免模型只输出标题。"""
+        if len(docs) <= 1:
+            return docs
+        kept = [doc for doc in docs if not self._is_low_information_doc(doc)]
+        return kept or docs
+
+    @staticmethod
+    def _is_low_information_doc(doc: Document) -> bool:
+        text = doc.page_content or ""
+        without_images = re.sub(r"\[IMG:[^\]]+\]", " ", text)
+        body = re.sub(r"#", " ", without_images)
+        body = re.sub(r"\s+", " ", body).strip()
+        return len(body) <= 20 and len(doc.metadata.get("related_images", [])) <= 2
+
+    def _expand_with_adjacent_chunks(
+        self, question: str, docs: List[Document]
+    ) -> List[Document]:
+        """
+        说明书步骤常被切到相邻 chunk；对步骤/安装/连接类问题补入后续片段，
+        防止只答第 1 步、漏掉第 2/3 步或输出“参见”的残片。
+        """
+        if not docs or not self._should_include_adjacent_chunks(question):
+            return docs
+        expanded: List[Document] = []
+        for doc in docs:
+            expanded.append(doc)
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            chunk_id = meta.get("chunk_id")
+            if not source or chunk_id is None:
+                continue
+            try:
+                base_id = int(chunk_id)
+            except (TypeError, ValueError):
+                continue
+            for offset in (-2, -1, 1, 2):
+                neighbor = self.chunk_document_lookup.get((source, base_id + offset))
+                if neighbor is not None:
+                    expanded.append(neighbor)
+        return self._merge_doc_lists_preserve_order(expanded)
+
+    @staticmethod
+    def _sort_docs_by_source_chunk_order(docs: List[Document]) -> List[Document]:
+        def key(doc: Document) -> tuple[str, int]:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            try:
+                chunk_id = int(meta.get("chunk_id"))
+            except (TypeError, ValueError):
+                chunk_id = 10**9
+            return source, chunk_id
+
+        return sorted(docs, key=key)
+
+    @staticmethod
+    def _should_include_adjacent_chunks(question: str) -> bool:
+        q = (question or "").lower()
+        return bool(
+            re.search(
+                r"how to|steps?|procedure|install|connect|charge|recharg|erase|delete|"
+                r"view.*tv|tv.*view|first three|assembly|start|replace|clean|flush|"
+                r"set up|设置|安装|连接|步骤|删除|查看|充电|更换|清洁|启动",
+                q,
+                re.IGNORECASE,
+            )
+        )
 
     def _merge_doc_lists_preserve_order(self, docs: List[Document]) -> List[Document]:
         """按正文去重，保留首次出现顺序；若后续重复分数更高则替换文档内容。"""

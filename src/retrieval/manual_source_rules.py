@@ -72,6 +72,11 @@ KEYWORD_SOURCE_PAIRS: Tuple[Tuple[str, str], ...] = tuple(
             ("t-rail", "Network_Camera"),
             ("power the camera", "Network_Camera"),
             ("camera battery", "Canon_Camera"),
+            ("camera image on TV", "Canon_Camera"),
+            ("camera images on TV", "Canon_Camera"),
+            ("view the camera image on TV", "Canon_Camera"),
+            ("viewing the images on a TV", "Canon_Camera"),
+            ("images on a TV", "Canon_Camera"),
             ("date/time battery", "Canon_Camera"),
             ("household power socket", "Canon_Camera"),
             ("off-center subject", "Canon_Camera"),
@@ -80,8 +85,13 @@ KEYWORD_SOURCE_PAIRS: Tuple[Tuple[str, str], ...] = tuple(
             ("CP direct", "Canon_Camera"),
             ("CF card", "Canon_Camera"),
             ("Mode Dial", "Canon_Camera"),
+            ("delete a single image", "Canon_Camera"),
+            ("erase a single image", "Canon_Camera"),
+            ("erasing a single image", "Canon_Camera"),
+            ("single image from my camera", "Canon_Camera"),
             ("lens", "Canon_Camera"),
             ("snowmobile", "Motorcycle"),
+            ("snowmobile steering system", "Motorcycle"),
             ("V-Belt", "Motorcycle"),
             ("v-belt", "Motorcycle"),
             ("brake lever", "Motorcycle"),
@@ -229,6 +239,14 @@ def required_source_substrings(question: str) -> Tuple[str, ...]:
             if src_sub not in seen:
                 seen.append(src_sub)
     if seen:
+        if (
+            "Canon_Camera" in seen
+            and "Color_Television" in seen
+            and any(term in q_lower for term in ("camera", "image", "images", "shooting"))
+        ):
+            seen = [src for src in seen if src != "Color_Television"]
+        if "Motorcycle" in seen and "Boat_210FSH" in seen and "snowmobile" in q_lower:
+            seen = [src for src in seen if src != "Boat_210FSH"]
         return tuple(seen)
     if is_mainly_english_query(q):
         return (_ENGLISH_SUMMARY_SOURCE,)
