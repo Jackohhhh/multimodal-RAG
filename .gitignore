@@ -1,5 +1,6 @@
 # Python
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -10,6 +11,18 @@ set_env.sh
 
 # 生成文件（可通过 preprocess 重新生成）
 data_processed/
+
+# 本地模型权重与缓存
+models/
+
+# 文档、评测产物与提交文件（不纳入版本库）
+docs/
+eval/results/
+submissions/
+
+# 题库目录仅跟踪公开赛题 CSV
+eval/questions/*.csv
+!eval/questions/question_public.csv
 
 # IDE
 .vscode/

@@ -65,8 +65,6 @@ multimodal-RAG/
 │   └── manuals/                 # 原始说明书数据，内容为 [text, [image_ids]]
 ├── data_processed/
 │   └── chunks/chunks.jsonl      # 预处理后的文本切片
-├── docs/
-│   └── multimodal_pipeline_guide.md
 ├── eval/
 │   ├── questions/               # 批量评测题库，支持 CSV / JSONL
 │   ├── results/                 # 批量答题结果
