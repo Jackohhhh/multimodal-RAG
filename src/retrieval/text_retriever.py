@@ -149,6 +149,7 @@ def build_text_retriever(
     use_hybrid_bm25: bool = False,
     vector_top_k: int = 4,
     bm25_top_k: int = 4,
+    rrf_k: int = 60,
     chunks_jsonl_path: Optional[str] = None,
     flashrank_model: Optional[str] = None,
     flashrank_cache_dir: Optional[str] = None,
@@ -175,6 +176,7 @@ def build_text_retriever(
                 bm25_retriever=bm25,
                 vector_k=vector_k,
                 bm25_top_k=bm25_top_k,
+                rrf_k=rrf_k,
             )
         else:
             print(

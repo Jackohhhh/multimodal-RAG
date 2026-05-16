@@ -129,6 +129,7 @@ class CustomerServiceAgent:
             use_hybrid_bm25=bool(retrieval_cfg.get("use_hybrid_bm25", False)),
             vector_top_k=int(retrieval_cfg.get("vector_top_k", 4)),
             bm25_top_k=int(retrieval_cfg.get("bm25_top_k", 4)),
+            rrf_k=int(retrieval_cfg.get("rrf_k", 60)),
             chunks_jsonl_path=chunks_path,
             flashrank_model=retrieval_cfg.get("flashrank_model"),
             flashrank_cache_dir=fr_cache,

@@ -42,18 +42,19 @@ chunking:
 
 # --- 检索参数 ---
 retrieval:
-  # 粗排候选：与 vector_top_k 取 max 后作为向量召回条数，供精排从更大池子里选真相关段
-  search_k: 25
-  rerank_top_n: 12
+  # 粗排候选：提高向量/BM25 原始召回后，用 RRF 融合排序再进入后续筛选
+  search_k: 50
+  rerank_top_n: 20
   use_rerank: false
   flashrank_model: "ms-marco-MiniLM-L-12-v2"
   flashrank_cache_dir: "./models/flashrank"
   rag_relevance_threshold: 0.4
   rag_fallback_relevance_threshold: 0.25
   use_hybrid_bm25: true
-  vector_top_k: 10
-  bm25_top_k: 8
-  rag_max_context_documents: 8
+  vector_top_k: 40
+  bm25_top_k: 40
+  rrf_k: 60
+  rag_max_context_documents: 10
   english_rag_only_no_customer_service_llm: true
   use_query_rewrite: true
   query_rewrite_languages: ["zh"]
