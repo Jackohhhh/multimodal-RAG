@@ -155,11 +155,12 @@ vector_store:
 retrieval:
   use_hybrid_bm25: true
   use_rerank: false
-  search_k: 25
-  vector_top_k: 10
-  bm25_top_k: 8
+  search_k: 50
+  vector_top_k: 40
+  bm25_top_k: 40
+  rrf_k: 60
   rag_relevance_threshold: 0.4
-  rag_fallback_relevance_threshold: 0.25
+  rag_max_context_documents: 10
 ```
 
 常见可调项：
