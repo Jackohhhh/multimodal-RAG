@@ -1,6 +1,6 @@
 """
-文本切分：将标记后的文本切分为片段，每个片段自动携带其包含的图片ID。
-先按说明书常见「章节标题」边界硬切，再对超长段做递归切分。
+文本切分：将标记后的文本切为「子块」建索引；可选按章节（Parent）保留整段上下文供 RAG。
+先按说明书常见「章节标题」边界硬切，再在章内递归切分更小的 Child；可去掉行首 ``#``。
 """
 import os
 import re
@@ -41,6 +41,65 @@ _SECTION_BOUNDARY = re.compile(
 
 # 仅含图片占位、无说明正文的段（预处理常见），并入相邻段以免检索碎片
 _ORPHAN_IMG_BLOCK = re.compile(r"^(\s*\[IMG:[^\]]+\]\s*)+$")
+
+def _strip_line_heading_hash_prefix(line: str) -> str:
+    """去掉行首 Markdown 标题的 ``#`` 前缀（不影响 ``[IMG:…]`` 行）。"""
+    stripped = line.lstrip(" \t")
+    if stripped.startswith("[IMG:"):
+        return line
+    if not stripped.startswith("#"):
+        return line
+    lead_ws_len = len(line) - len(stripped)
+    prefix = line[:lead_ws_len]
+    rest = stripped
+    i = 0
+    while i < len(rest) and rest[i] == "#":
+        i += 1
+    tail = rest[i:]
+    if tail.startswith((" ", "\t")):
+        tail = tail[1:]
+    return prefix + tail
+
+
+def strip_heading_hashes_multiline(text: str) -> str:
+    """对全文逐行移除 ``#`` 章节标记（章节边界已由 ``_split_by_headers`` 处理完毕后再调用）。"""
+    parts = [_strip_line_heading_hash_prefix(li) for li in text.splitlines()]
+    return "\n".join(parts)
+
+
+def extract_section_heading_hints(section: str, *, max_segments: int = 16) -> str:
+    """在去掉 ``#`` 之前，抽取章节内标题行概要，写入 metadata 供标题补召回。"""
+    hints: List[str] = []
+    for line in (section or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("[IMG:"):
+            continue
+        if not s.startswith("#"):
+            if hints:
+                break
+            continue
+        for segment in s.split("#"):
+            piece = segment.strip()
+            if not piece:
+                continue
+            title = re.split(r"[。；;.!！?？\n]", piece, maxsplit=1)[0].strip()
+            if title:
+                hints.append(title[:80])
+                if len(hints) >= max_segments:
+                    return "\n".join(hints)
+    return "\n".join(hints)
+
+
+def _finalize_chunk_pipeline(chunks: List[str]) -> List[str]:
+    """
+    对同一批分段做：孤立图合并、段首图回移、「仅标题」块合并、[IMG:] 下移块尾。
+    用于启用了 Parent-Chunk 时对「小节内」片段链做整形。
+    """
+    parts = _merge_orphan_img_sections(chunks)
+    parts = _relocate_leading_img_lines_to_previous(parts)
+    parts = _merge_heading_only_stacks_forward(parts)
+    return [_move_leading_img_lines_to_chunk_end(s) for s in parts]
+
 
 def _chunk_has_excessive_dot_run(text: str, max_allowed_consecutive: int = 10) -> bool:
     """
@@ -329,16 +388,21 @@ def chunk_marked_text(
     *,
     strip_dot_leader_lines: bool = True,
     dot_run_max_allowed: int = 10,
-) -> List["Document"]:
+    strip_heading_hashes: bool = True,
+    use_parent_document_retrieval: bool = False,
+    child_chunk_size: Optional[int] = None,
+    child_chunk_overlap: Optional[int] = None,
+) -> tuple[List["Document"], List[dict]]:
     """
     切分含 [IMG:xxx] 标记的文本。
 
     策略：先按章节边界硬切（见 ``_split_by_headers``），合并孤立图块与
-    ``# A.``/``# B.`` 等子节，并将「段首图 + 下接 # 标题或英文编号步骤」的图行移回上一段末尾，
-    再合并「仅含 # 标题行」的孤立短块；仅对超长段递归切分，并对子块再次合并孤儿图、图行回移与标题合并。
-    最后将「段首连续 [IMG:]、后接正文」的图行挪到块末，减轻英文手册中图标记挤在检索文本开头的问题。
-    可选：若块内出现「超过 dot_run_max_allowed 个」连续 ``.``（目录引导线等），整段丢弃。
-    每个 chunk 的 metadata 自动包含该 chunk 内出现的图片ID列表。
+    ``# A.``/``# B.`` 等子节；再对超长段递归切分，并对子块合并孤儿图、图行回移与标题栈。
+    可选 **Parent-Document Retrieval**：对每个章节块（Parent）用更小的子块（Child）建索引，
+    Parent 正文由 ``save_chunks_to_jsonl`` 一并写入可选的 ``chunks_parents.jsonl``。
+    ``strip_heading_hashes``：在分段与递归切完成后去掉行首 ``#``，减轻向量与模型噪声。
+    可选丢弃含超长连续 ``.`` 的片段（目录引导线）。
+    每个 chunk 的 metadata 含 ``related_images``；启用父文档时另有 ``parent_id``、``section_heading_hints``。
     """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_core.documents import Document
@@ -348,90 +412,197 @@ def chunk_marked_text(
 
     sections = _split_by_headers(marked_text)
 
+    eff_child_size = (
+        int(child_chunk_size)
+        if use_parent_document_retrieval and child_chunk_size is not None
+        else chunk_size
+    )
+    eff_child_overlap = (
+        int(child_chunk_overlap)
+        if use_parent_document_retrieval and child_chunk_overlap is not None
+        else chunk_overlap
+    )
+
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
+        chunk_size=eff_child_size,
+        chunk_overlap=eff_child_overlap,
         separators=separators,
         keep_separator=True,
     )
 
-    all_chunks: List[str] = []
-    for section in sections:
-        if len(section) <= chunk_size:
-            all_chunks.append(section)
-        else:
-            sub_chunks = text_splitter.split_text(section)
-            all_chunks.extend(sub_chunks)
+    all_chunks: List[tuple[Optional[int], Optional[str], str]] = []
 
-    # 递归切分可能产生「仅 [IMG:]」短块，需与章节级同样先合并再回移图行
-    all_chunks = _merge_orphan_img_sections(all_chunks)
-    all_chunks = _relocate_leading_img_lines_to_previous(all_chunks)
-    all_chunks = _merge_heading_only_stacks_forward(all_chunks)
-    all_chunks = [_move_leading_img_lines_to_chunk_end(s) for s in all_chunks]
+    parent_sidecar: List[dict] = []
+
+    if use_parent_document_retrieval:
+        for parent_id, section in enumerate(sections):
+            hints_nl = extract_section_heading_hints(section) or ""
+            hints_str = hints_nl if hints_nl else None
+
+            if strip_heading_hashes:
+                parent_plain = strip_heading_hashes_multiline(section.strip())
+            else:
+                parent_plain = section.strip()
+
+            if (
+                strip_dot_leader_lines
+                and parent_plain
+                and _chunk_has_excessive_dot_run(
+                    parent_plain, max_allowed_consecutive=dot_run_max_allowed
+                )
+            ):
+                continue
+
+            p_imgs = re.findall(r"\[IMG:([^\]]+)\]", parent_plain)
+            parent_sidecar.append(
+                {
+                    "parent_id": parent_id,
+                    "content": parent_plain,
+                    "related_images": p_imgs,
+                    "section_heading_hints": hints_nl,
+                }
+            )
+
+            raw_list = (
+                [section]
+                if len(section) <= eff_child_size
+                else text_splitter.split_text(section)
+            )
+            finalized = _finalize_chunk_pipeline(raw_list)
+
+            for child_text in finalized:
+                core = (child_text or "").strip()
+                if not core:
+                    continue
+                all_chunks.append((parent_id, hints_str, core))
+    else:
+        for section in sections:
+            if len(section) <= chunk_size:
+                all_chunks.append((None, None, section))
+            else:
+                for sub in text_splitter.split_text(section):
+                    all_chunks.append((None, None, sub))
+
+        str_chunks = [item[2] for item in all_chunks]
+        str_chunks = _merge_orphan_img_sections(str_chunks)
+        str_chunks = _relocate_leading_img_lines_to_previous(str_chunks)
+        str_chunks = _merge_heading_only_stacks_forward(str_chunks)
+        str_chunks = [
+            _move_leading_img_lines_to_chunk_end(s) for s in str_chunks
+        ]
+        all_chunks = [(None, None, s) for s in str_chunks]
+
+    merged_out = [txt for _, _, txt in all_chunks]
+
+    meta_parent_ids = [pid for pid, _, _ in all_chunks]
+    meta_parent_hints = [h for _, h, _ in all_chunks]
+
+    if strip_heading_hashes:
+        merged_out = [strip_heading_hashes_multiline(x) for x in merged_out]
 
     if strip_dot_leader_lines:
-        kept: List[str] = []
+        kept: List[tuple[str, Optional[int], Optional[str]]] = []
         dropped_dot = 0
-        for s in all_chunks:
-            if _chunk_has_excessive_dot_run(s, max_allowed_consecutive=dot_run_max_allowed):
+        for chunk_text, pid, hint in zip(merged_out, meta_parent_ids, meta_parent_hints):
+            if _chunk_has_excessive_dot_run(
+                chunk_text, max_allowed_consecutive=dot_run_max_allowed
+            ):
                 dropped_dot += 1
                 continue
-            kept.append(s)
+            kept.append((chunk_text, pid, hint))
         if dropped_dot:
             print(
                 f"  [{source}] 含连续句点超过 {dot_run_max_allowed} 个的片段整段丢弃: {dropped_dot} 个"
             )
-        all_chunks = kept
+        merged_out = [k[0] for k in kept]
+        meta_parent_ids = [k[1] for k in kept]
+        meta_parent_hints = [k[2] for k in kept]
 
-    # 过滤极短（< 8 字符）且无图片标记的孤立 chunk（如单独的句号、纯标题行、空白段）
+    # 过滤极短（< 8 字符）且无图片标记的孤立 chunk
     kept_nonempty: List[str] = []
+    kept_pid: List[Optional[int]] = []
+    kept_hints: List[Optional[str]] = []
     dropped_short = 0
-    for s in all_chunks:
-        stripped = s.strip()
-        if len(stripped) < 8 and not re.search(r'\[IMG:', stripped):
+    for i, chunk_text in enumerate(merged_out):
+        stripped = chunk_text.strip()
+        if len(stripped) < 8 and not re.search(r"\[IMG:", stripped):
             dropped_short += 1
             continue
-        kept_nonempty.append(s)
+        kept_nonempty.append(chunk_text)
+        kept_pid.append(meta_parent_ids[i])
+        kept_hints.append(meta_parent_hints[i])
     if dropped_short:
         print(f"  [{source}] 丢弃极短无效片段: {dropped_short} 个")
-    all_chunks = kept_nonempty
 
-    documents = []
-    for i, chunk_text in enumerate(all_chunks):
-        image_ids = re.findall(r'\[IMG:([^\]]+)\]', chunk_text)
-
-        doc = Document(
-            page_content=chunk_text,
-            metadata={
-                "source": source,
-                "chunk_id": i,
-                "related_images": image_ids,
-            },
+    documents: List[Document] = []
+    for i, chunk_text in enumerate(kept_nonempty):
+        image_ids = re.findall(r"\[IMG:([^\]]+)\]", chunk_text)
+        meta: dict = {
+            "source": source,
+            "chunk_id": i,
+            "related_images": image_ids,
+        }
+        pid = kept_pid[i]
+        if pid is not None:
+            meta["parent_id"] = pid
+            h = kept_hints[i]
+            if h:
+                meta["section_heading_hints"] = h
+        documents.append(
+            Document(
+                page_content=chunk_text,
+                metadata=meta,
+            )
         )
-        documents.append(doc)
 
     total_images = sum(len(d.metadata["related_images"]) for d in documents)
+    mode = (
+        f"父子索引(child={eff_child_size}±{eff_child_overlap})"
+        if use_parent_document_retrieval
+        else f"单粒度(size={chunk_size})"
+    )
     print(
-        f"切分完成: {len(documents)} 个片段，"
+        f"切分完成 ({mode}): {len(documents)} 个片段，"
         f"其中 {sum(1 for d in documents if d.metadata['related_images'])} 个含图片，"
         f"共关联 {total_images} 张图"
     )
-    return documents
+    return documents, parent_sidecar
 
 
-def save_chunks_to_jsonl(chunks: List["Document"], output_path: str):
-    """将切分结果保存为 JSONL"""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+def save_chunks_to_jsonl(
+    chunks: List["Document"],
+    output_path: str,
+    *,
+    parents: Optional[List[dict]] = None,
+    parents_output_path: Optional[str] = None,
+):
+    """将子片段写入 JSONL；可选同时写入 Parent 上下文（chunks_parents.jsonl）。"""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         for chunk in chunks:
-            record = {
-                "chunk_id": chunk.metadata.get("chunk_id"),
+            meta = chunk.metadata or {}
+            record: dict = {
+                "chunk_id": meta.get("chunk_id"),
                 "content": chunk.page_content,
-                "source": chunk.metadata.get("source", ""),
-                "related_images": chunk.metadata.get("related_images", []),
+                "source": meta.get("source", ""),
+                "related_images": meta.get("related_images", []),
             }
+            pid = meta.get("parent_id")
+            if pid is not None:
+                record["parent_id"] = pid
+            sh = meta.get("section_heading_hints")
+            if sh:
+                record["section_heading_hints"] = sh
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     print(f"切片保存到 {output_path}，共 {len(chunks)} 条")
+
+    rows = parents or []
+    if rows and parents_output_path:
+        os.makedirs(os.path.dirname(parents_output_path) or ".", exist_ok=True)
+        with open(parents_output_path, "w", encoding="utf-8") as pf:
+            for row in rows:
+                pf.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"Parent 上下文保存到 {parents_output_path}，共 {len(rows)} 条")
 
 
 def load_chunks_from_jsonl(input_path: str) -> List["Document"]:
@@ -445,13 +616,45 @@ def load_chunks_from_jsonl(input_path: str) -> List["Document"]:
             if not line:
                 continue
             record = json.loads(line)
+            meta: dict = {
+                "source": record.get("source", ""),
+                "chunk_id": record.get("chunk_id"),
+                "related_images": record.get("related_images", []),
+            }
+            pid = record.get("parent_id")
+            if pid is not None:
+                meta["parent_id"] = pid
+            sh = record.get("section_heading_hints")
+            if sh:
+                meta["section_heading_hints"] = sh
             doc = Document(
                 page_content=record["content"],
-                metadata={
-                    "source": record.get("source", ""),
-                    "chunk_id": record.get("chunk_id"),
-                    "related_images": record.get("related_images", []),
-                },
+                metadata=meta,
             )
             documents.append(doc)
     return documents
+
+
+def load_parents_from_jsonl(input_path: str) -> dict[tuple[str, int], dict]:
+    """
+    {(source basename or key string, parent_id): {"content", "related_images", "section_heading_hints"}}
+    """
+    lookup: dict[tuple[str, int], dict] = {}
+    if not input_path or not os.path.isfile(input_path):
+        return lookup
+    with open(input_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            src = record.get("source") or ""
+            pid = record.get("parent_id")
+            if pid is None:
+                continue
+            lookup[(src, int(pid))] = {
+                "content": record.get("content") or "",
+                "related_images": record.get("related_images") or [],
+                "section_heading_hints": record.get("section_heading_hints") or "",
+            }
+    return lookup

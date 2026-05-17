@@ -27,6 +27,8 @@ data:
   manuals_path: "./data/manuals"        # 存放 [text, [image_ids]] 格式的 JSON 文件
   images_path: "./data/images"          # 配图文件（按图片ID命名）
   chunks_output: "./data_processed/chunks/chunks.jsonl"
+  # 可选；留空则由 Agent 在同目录下探测 chunks_parents.jsonl
+  chunks_parents_output: ""
 
 # --- 向量数据库 ---
 vector_store:
@@ -39,6 +41,10 @@ chunking:
   chunk_overlap: 100
   strip_dot_leader_lines: true
   dot_run_max_allowed: 10
+  strip_heading_hashes: true  # 切分完成后去掉标题行前缀 #
+  use_parent_document_retrieval: true
+  child_chunk_size: 450
+  child_chunk_overlap: 90
 
 # --- 检索参数 ---
 retrieval:

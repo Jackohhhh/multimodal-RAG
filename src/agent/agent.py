@@ -114,9 +114,29 @@ class CustomerServiceAgent:
         chunks_path = data_cfg.get("chunks_output")
         if chunks_path:
             chunks_path = os.path.expandvars(chunks_path)
+
+        pp = data_cfg.get("chunks_parents_output")
+        if isinstance(pp, str) and pp.strip():
+            pp = os.path.expandvars(pp.strip())
+        elif chunks_path:
+            cand = os.path.join(os.path.dirname(chunks_path), "chunks_parents.jsonl")
+            pp = cand if os.path.isfile(cand) else None
+        else:
+            pp = None
+
         self.chunk_documents = self._load_chunk_documents(chunks_path)
         self.chunk_document_lookup = self._build_chunk_document_lookup(
             self.chunk_documents
+        )
+
+        try:
+            from src.preprocess.chunk_text import load_parents_from_jsonl
+        except ImportError:
+            load_parents_from_jsonl = None
+        self.chunk_parents_lookup = (
+            load_parents_from_jsonl(pp)
+            if (pp and load_parents_from_jsonl)
+            else {}
         )
         fr_cache = retrieval_cfg.get("flashrank_cache_dir")
         if fr_cache:
@@ -406,16 +426,17 @@ class CustomerServiceAgent:
                 source = item.get("source") or ""
                 if not content or not source:
                     continue
-                docs.append(
-                    Document(
-                        page_content=content,
-                        metadata={
-                            "chunk_id": item.get("chunk_id"),
-                            "source": source,
-                            "related_images": item.get("related_images") or [],
-                        },
-                    )
-                )
+                meta = {
+                    "chunk_id": item.get("chunk_id"),
+                    "source": source,
+                    "related_images": item.get("related_images") or [],
+                }
+                if item.get("parent_id") is not None:
+                    meta["parent_id"] = item["parent_id"]
+                sh = item.get("section_heading_hints")
+                if sh:
+                    meta["section_heading_hints"] = sh
+                docs.append(Document(page_content=content, metadata=meta))
         return docs
 
     @staticmethod
@@ -461,7 +482,7 @@ class CustomerServiceAgent:
             source = (doc.metadata.get("source") or "") if doc.metadata else ""
             if not any(src in source for src in required_sources):
                 continue
-            headings = self._heading_text(doc.page_content)
+            headings = self._heading_signals_for_document(doc)
             match_text = f"{headings}\n{doc.page_content or ''}"
             if not headings and not match_text.strip():
                 continue
@@ -477,7 +498,6 @@ class CustomerServiceAgent:
                     score,
                     self._english_text_match_score(query_tokens, match_text),
                 )
-            score += self._manual_phrase_match_bonus(expanded_question, match_text)
             if query_bigrams and overlap >= 2:
                 score = max(score, overlap * 8.0)
             if score < 6.0:
@@ -498,7 +518,8 @@ class CustomerServiceAgent:
         return out
 
     @staticmethod
-    def _heading_text(content: str) -> str:
+    def _heading_text_from_hashes(content: str) -> str:
+        """行内仍存在 ``#`` 时兜底解析简短标题片段（预处理已去掉行首标记时亦可留空）。"""
         headings = []
         for line in (content or "").splitlines():
             if "#" not in line:
@@ -512,6 +533,19 @@ class CustomerServiceAgent:
                 if title:
                     headings.append(title[:40])
         return " ".join(headings)
+
+    @staticmethod
+    def _heading_signals_for_document(doc: Document) -> str:
+        md = doc.metadata or {}
+        hints = md.get("section_heading_hints")
+        if isinstance(hints, str) and hints.strip():
+            collapsed = " ".join(
+                ln.strip()
+                for ln in hints.strip().splitlines()
+                if ln.strip()
+            )
+            return collapsed[:480]
+        return CustomerServiceAgent._heading_text_from_hashes(doc.page_content or "")
 
     @staticmethod
     def _cjk_bigrams(text: str) -> set[str]:
@@ -563,43 +597,6 @@ class CustomerServiceAgent:
             if re.search(rf"\b{re.escape(token)}\b", text_lower):
                 phrase_bonus += 0.5
         return specificity + coverage * 10.0 + phrase_bonus
-
-    @staticmethod
-    def _manual_phrase_match_bonus(question: str, text: str) -> float:
-        q = (question or "").lower()
-        t = (text or "").lower()
-        phrase_rules: Tuple[Tuple[str, str, float], ...] = (
-            ("battery conversion", "# battery switches", 30.0),
-            ("delete a single image", "# erasing a single image", 38.0),
-            ("delete a single image", "# erase the image", 34.0),
-            ("erase a single image", "# erasing a single image", 38.0),
-            ("single image from my camera", "# erasing a single image", 38.0),
-            ("camera image on tv", "# connect the camera to the tv", 38.0),
-            ("view the camera image on tv", "# connect the camera to the tv", 38.0),
-            ("anchor light", "# anchor light", 28.0),
-            ("maintenance setting screen", "# maintenance setting screen", 32.0),
-            ("make the boat move forward", "# forward", 32.0),
-            ("ready to sail", "# forward", 24.0),
-            ("steering system", "# steering system checks", 32.0),
-            ("robot anatomy", "buttons&indicators", 34.0),
-            ("robot anatomy", "bottomview", 30.0),
-            ("vacuum anatomy", "buttons&indicators", 34.0),
-            ("steering system on a snowmobile", "# steering system", 36.0),
-            ("proper way to use the steering system on a snowmobile", "# steering system", 36.0),
-            ("connecting the fax", "# connect the product safely", 30.0),
-            ("assembly process", "# assembly", 30.0),
-            ("start the engine", "starting theengine", 28.0),
-            ("start the engine", "starting the engine", 28.0),
-            ("start the engine", "fully open the starter lever", 36.0),
-            ("start the engine", "manual starting model", 30.0),
-            ("clean a snowmobile", "# 1. cleaning", 28.0),
-            ("clean snowmobile", "# 1. cleaning", 28.0),
-            ("山地", "# 山地", 32.0),
-            ("重要组成部件", "# 部件介绍", 28.0),
-            ("测量我的心率", "# 心率信号丢失", 18.0),
-            ("测量我的心率", "# 查看心率", 18.0),
-        )
-        return sum(bonus for needle, title, bonus in phrase_rules if needle in q and title in t)
 
     @classmethod
     def _section_title_match_score(
@@ -768,6 +765,51 @@ class CustomerServiceAgent:
                 pass
         return None
 
+    def _expand_documents_to_parents(self, docs: List[Document]) -> List[Document]:
+        """若存在 Parent 侧车：将进入 RAG 的子块替换为该块所属整段 Parent（同 Parent 多只保留首次出现顺序）。"""
+        lk = getattr(self, "chunk_parents_lookup", {}) or {}
+        if not lk:
+            return docs
+        out: List[Document] = []
+        emitted: set[tuple[str, int]] = set()
+        for doc in docs:
+            meta = dict(doc.metadata or {})
+            pid = meta.get("parent_id")
+            src = meta.get("source") or ""
+            if pid is None:
+                out.append(doc)
+                continue
+            try:
+                ip = int(pid)
+            except (TypeError, ValueError):
+                out.append(doc)
+                continue
+            pk = (src, ip)
+            if pk in emitted:
+                continue
+            emitted.add(pk)
+            block = lk.get(pk)
+            if not block:
+                out.append(doc)
+                continue
+            body = (block.get("content") or "").strip()
+            if not body:
+                out.append(doc)
+                continue
+            merged_imgs = list(
+                dict.fromkeys(
+                    list(meta.get("related_images") or [])
+                    + list(block.get("related_images") or [])
+                )
+            )
+            new_meta = dict(meta)
+            new_meta["related_images"] = merged_imgs
+            hh = block.get("section_heading_hints")
+            if hh:
+                new_meta["section_heading_hints"] = hh
+            out.append(Document(page_content=body, metadata=new_meta))
+        return out
+
     def _select_docs_for_rag(self, question: str, docs: List[Document]) -> List[Document]:
         """
         进入 RAG 前的筛选：
@@ -782,6 +824,7 @@ class CustomerServiceAgent:
         candidates = self._drop_low_information_docs(candidates)
         candidates = self._expand_with_adjacent_chunks(question, candidates)
         prioritized = self._prioritize_docs_by_section_intent(question, candidates)
+        prioritized = self._expand_documents_to_parents(prioritized)
         return self._limit_rag_context_documents(prioritized)
 
     def _filter_docs_above_rag_threshold(self, docs: List[Document]) -> List[Document]:
@@ -823,22 +866,19 @@ class CustomerServiceAgent:
             text = doc.page_content or ""
             title_score = self._section_title_match_score(
                 question,
-                self._heading_text(text),
+                self._heading_signals_for_document(doc),
                 required_sources,
             )
-            doc_score = title_score + self._manual_phrase_match_bonus(question, text)
+            doc_score = title_score
             if doc_score >= 8 or any(term in text for term in title_terms):
                 preferred.append(doc)
             else:
                 rest.append(doc)
         preferred.sort(
-            key=lambda doc: (
-                self._section_title_match_score(
-                    question,
-                    self._heading_text(doc.page_content),
-                    required_sources,
-                )
-                + self._manual_phrase_match_bonus(question, doc.page_content)
+            key=lambda doc: self._section_title_match_score(
+                question,
+                self._heading_signals_for_document(doc),
+                required_sources,
             ),
             reverse=True,
         )
@@ -871,7 +911,11 @@ class CustomerServiceAgent:
     ) -> List[Document]:
         step_docs = [
             doc for doc in docs
-            if re.match(r"\s*#\s*(assembly|[123]\b)", doc.page_content or "", re.IGNORECASE)
+            if re.match(
+                r"\s*(?:#\s*)?(assembly|1|2|3)\b",
+                doc.page_content or "",
+                re.IGNORECASE,
+            )
         ]
         if not step_docs:
             return docs

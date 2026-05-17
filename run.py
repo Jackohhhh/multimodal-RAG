@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+from typing import List
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_OFFLINE", "1") #加了 HF_HUB_OFFLINE=1 后，启动时直接读本地缓存，不再联网检查 HuggingFace。启动速度也会快一些
@@ -41,6 +42,11 @@ def cmd_preprocess(args):
     # --- 步骤 2: 解析 <PIC> 占位符，替换为 [IMG:图片ID] ---
     print("\n=== 步骤 2: 解析图文映射 ===")
     all_chunks = []
+    grouped_parents: List[dict] = []
+    chunk_cfg = config.get("chunking") or {}
+    use_parents = bool(chunk_cfg.get("use_parent_document_retrieval", False))
+    child_sz = chunk_cfg.get("child_chunk_size")
+    child_ov = chunk_cfg.get("child_chunk_overlap")
     for doc_info in raw_docs:
         marked_text, mapping = build_documents_with_images(
             text=doc_info["text"],
@@ -51,19 +57,36 @@ def cmd_preprocess(args):
         print(f"  {doc_info['filename']}: {pic_count} 个 <PIC> 已映射为 [IMG:id]")
 
         # --- 步骤 3: 切分（保留 [IMG:id] 标记）---
-        chunk_cfg = config.get("chunking") or {}
-        chunks = chunk_marked_text(
+        chunks, parent_rows = chunk_marked_text(
             marked_text=marked_text,
             source=doc_info["filename"],
             chunk_size=chunk_cfg["chunk_size"],
             chunk_overlap=chunk_cfg["chunk_overlap"],
             strip_dot_leader_lines=bool(chunk_cfg.get("strip_dot_leader_lines", True)),
             dot_run_max_allowed=int(chunk_cfg.get("dot_run_max_allowed", 10)),
+            strip_heading_hashes=bool(chunk_cfg.get("strip_heading_hashes", True)),
+            use_parent_document_retrieval=use_parents,
+            child_chunk_size=int(child_sz) if child_sz is not None else None,
+            child_chunk_overlap=int(child_ov) if child_ov is not None else None,
         )
         all_chunks.extend(chunks)
+        for row in parent_rows:
+            grouped_parents.append({"source": doc_info["filename"], **row})
 
     print(f"\n总计: {len(all_chunks)} 个片段")
-    save_chunks_to_jsonl(all_chunks, data_cfg["chunks_output"])
+    chunks_out = os.path.expandvars(data_cfg["chunks_output"])
+    parents_out = chunk_cfg.get("chunks_parents_output")
+    if isinstance(parents_out, str):
+        parents_out = os.path.expandvars(parents_out)
+    elif use_parents:
+        parents_out = os.path.join(os.path.dirname(chunks_out), "chunks_parents.jsonl")
+
+    save_chunks_to_jsonl(
+        all_chunks,
+        chunks_out,
+        parents=grouped_parents if use_parents else None,
+        parents_output_path=parents_out if use_parents else None,
+    )
 
     # --- 步骤 4: 构建向量索引 ---
     print("\n=== 步骤 3: 构建向量索引 ===")
