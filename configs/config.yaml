@@ -60,7 +60,7 @@ retrieval:
   vector_top_k: 40
   bm25_top_k: 40
   rrf_k: 60
-  rag_max_context_documents: 10
+  rag_max_context_documents: 40
   english_rag_only_no_customer_service_llm: true
   use_query_rewrite: true
   query_rewrite_languages: ["zh"]

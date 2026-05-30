@@ -128,6 +128,9 @@ class CustomerServiceAgent:
         self.chunk_document_lookup = self._build_chunk_document_lookup(
             self.chunk_documents
         )
+        self.chunk_document_by_parent_lookup = (
+            self._build_chunk_document_by_parent_lookup(self.chunk_documents)
+        )
 
         try:
             from src.preprocess.chunk_text import load_parents_from_jsonl
@@ -311,37 +314,60 @@ class CustomerServiceAgent:
                 if retrieval_queries is not None
                 else sub_q
             )
-            raw_docs = self._retrieve_with_rewrite(rq, original_question=question)
-            pre_filter_n = len(raw_docs)
-            docs = self._select_docs_for_rag(question, raw_docs)
-            log_retrieved_docs(
-                rq,
-                docs,
-                pre_filter_hit_count=pre_filter_n,
-                rag_relevance_threshold=self.rag_relevance_threshold,
-            )
+            tried_queries = [rq]
+            raw_docs, docs = self._retrieve_selected_docs_for_rag(question, rq)
+            self._log_rag_retrieval(rq, raw_docs, docs)
             if not docs:
-                sub_answers.append(
-                    self._no_rag_docs_answer(question, sub_q)
+                retry = self._retry_retrieval_after_rag_miss(
+                    question,
+                    sub_q,
+                    tried_queries,
                 )
-                continue
+                if retry is not None:
+                    rq, raw_docs, docs = retry
+                if not docs:
+                    sub_answers.append(
+                        self._no_rag_docs_answer(question, sub_q)
+                    )
+                    continue
 
             context = format_docs(docs)
 
             if not context.strip():
-                sub_answers.append(
-                    self._no_rag_docs_answer(question, sub_q)
+                retry = self._retry_retrieval_after_rag_miss(
+                    question,
+                    sub_q,
+                    tried_queries,
                 )
-                continue
+                if retry is not None:
+                    rq, raw_docs, docs = retry
+                    context = format_docs(docs)
+                if not context.strip():
+                    sub_answers.append(
+                        self._no_rag_docs_answer(question, sub_q)
+                    )
+                    continue
 
-            response = (
-                self.rag_prompt
-                | self.llm
-                | StrOutputParser()
-            ).invoke({
-                "context": context,
-                "question": sub_q,
-            })
+            response = self._invoke_rag(context, sub_q)
+
+            if self._needs_customer_service_fallback(response):
+                retry = self._retry_retrieval_after_rag_miss(
+                    question,
+                    sub_q,
+                    tried_queries,
+                )
+                if retry is not None:
+                    rq, raw_docs, docs = retry
+                    retry_context = format_docs(docs)
+                    if retry_context.strip():
+                        retry_response = self._invoke_rag(retry_context, sub_q)
+                        if not self._needs_customer_service_fallback(retry_response):
+                            context = retry_context
+                            response = retry_response
+                        else:
+                            response = retry_response
+                    else:
+                        response = ""
 
             if self._needs_customer_service_fallback(response):
                 sub_answers.append(
@@ -361,6 +387,89 @@ class CustomerServiceAgent:
 
             sub_answers.append(response)
         return sub_answers
+
+    def _retrieve_selected_docs_for_rag(
+        self,
+        question: str,
+        retrieval_query: str,
+    ) -> Tuple[List[Document], List[Document]]:
+        raw_docs = self._retrieve_with_rewrite(
+            retrieval_query,
+            original_question=question,
+        )
+        docs = self._select_docs_for_rag(question, raw_docs)
+        return raw_docs, docs
+
+    def _log_rag_retrieval(
+        self,
+        retrieval_query: str,
+        raw_docs: List[Document],
+        docs: List[Document],
+    ) -> None:
+        log_retrieved_docs(
+            retrieval_query,
+            docs,
+            pre_filter_hit_count=len(raw_docs),
+            rag_relevance_threshold=self.rag_relevance_threshold,
+        )
+
+    def _invoke_rag(self, context: str, question: str) -> str:
+        return (
+            self.rag_prompt
+            | self.llm
+            | StrOutputParser()
+        ).invoke({
+            "context": context,
+            "question": question,
+        })
+
+    def _retry_retrieval_after_rag_miss(
+        self,
+        question: str,
+        sub_question: str,
+        tried_queries: List[str],
+    ) -> Optional[Tuple[str, List[Document], List[Document]]]:
+        rewritten = self._rewrite_query_after_rag_miss(
+            question,
+            sub_question,
+            tried_queries,
+        )
+        if not rewritten:
+            return None
+
+        tried_queries.append(rewritten)
+        raw_docs, docs = self._retrieve_selected_docs_for_rag(question, rewritten)
+        self._log_rag_retrieval(rewritten, raw_docs, docs)
+        return rewritten, raw_docs, docs
+
+    def _rewrite_query_after_rag_miss(
+        self,
+        question: str,
+        sub_question: str,
+        tried_queries: List[str],
+    ) -> str:
+        base_question = (sub_question or question or "").strip()
+        if self.retrieval_query_rewrite_prompt is not None:
+            rewritten = self._rewrite_retrieval_query(base_question)
+            if self._is_new_retrieval_query(rewritten, tried_queries):
+                return rewritten.strip()
+
+        if self.query_expand_prompt is not None:
+            expanded = self._expand_query(base_question)
+            if self._is_new_retrieval_query(expanded, tried_queries):
+                return expanded.strip()
+        return ""
+
+    def _is_new_retrieval_query(
+        self,
+        candidate: str,
+        tried_queries: List[str],
+    ) -> bool:
+        candidate = (candidate or "").strip()
+        return bool(candidate) and not any(
+            self._same_query_for_retrieval(candidate, tried)
+            for tried in tried_queries
+        )
 
     def _expand_query(self, question: str) -> str:
         """用 LLM 将问题改写为详细的扩展检索查询（单行输出）。"""
@@ -454,6 +563,35 @@ class CustomerServiceAgent:
                 lookup[(source, int(chunk_id))] = doc
             except (TypeError, ValueError):
                 continue
+        return lookup
+
+    @staticmethod
+    def _build_chunk_document_by_parent_lookup(
+        docs: List[Document],
+    ) -> dict[tuple[str, int], Document]:
+        """每个 parent 保留 chunk_id 最小的一条子块，供 parent 级相邻扩展。"""
+        lookup: dict[tuple[str, int], Document] = {}
+        for doc in docs:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            parent_id = meta.get("parent_id")
+            if not source or parent_id is None:
+                continue
+            try:
+                key = (source, int(parent_id))
+            except (TypeError, ValueError):
+                continue
+            existing = lookup.get(key)
+            if existing is None:
+                lookup[key] = doc
+                continue
+            try:
+                existing_cid = int(existing.metadata.get("chunk_id", 10**9))
+                new_cid = int(meta.get("chunk_id", 10**9))
+            except (TypeError, ValueError):
+                existing_cid, new_cid = 10**9, 10**9
+            if new_cid < existing_cid:
+                lookup[key] = doc
         return lookup
 
     def _retrieve_matching_section_titles(self, question: str) -> List[Document]:
@@ -765,13 +903,26 @@ class CustomerServiceAgent:
                 pass
         return None
 
+    @staticmethod
+    def _prefer_rag_parent_document(existing: Document, candidate: Document) -> bool:
+        """同 parent 重复时优先保留检索锚点，其次更高分。"""
+        existing_adj = bool((existing.metadata or {}).get("adjacent_context"))
+        candidate_adj = bool((candidate.metadata or {}).get("adjacent_context"))
+        if existing_adj and not candidate_adj:
+            return True
+        if not existing_adj and candidate_adj:
+            return False
+        existing_score = CustomerServiceAgent._retrieval_score_for_threshold(existing) or 0.0
+        candidate_score = CustomerServiceAgent._retrieval_score_for_threshold(candidate) or 0.0
+        return candidate_score > existing_score
+
     def _expand_documents_to_parents(self, docs: List[Document]) -> List[Document]:
-        """若存在 Parent 侧车：将进入 RAG 的子块替换为该块所属整段 Parent（同 Parent 多只保留首次出现顺序）。"""
+        """若存在 Parent 侧车：将进入 RAG 的子块替换为该块所属整段 Parent（同 Parent 去重时保留检索锚点）。"""
         lk = getattr(self, "chunk_parents_lookup", {}) or {}
         if not lk:
             return docs
         out: List[Document] = []
-        emitted: set[tuple[str, int]] = set()
+        parent_slot: dict[tuple[str, int], int] = {}
         for doc in docs:
             meta = dict(doc.metadata or {})
             pid = meta.get("parent_id")
@@ -785,46 +936,49 @@ class CustomerServiceAgent:
                 out.append(doc)
                 continue
             pk = (src, ip)
-            if pk in emitted:
-                continue
-            emitted.add(pk)
             block = lk.get(pk)
             if not block:
-                out.append(doc)
+                expanded = doc
+            else:
+                body = (block.get("content") or "").strip()
+                if not body:
+                    expanded = doc
+                else:
+                    merged_imgs = list(
+                        dict.fromkeys(
+                            list(meta.get("related_images") or [])
+                            + list(block.get("related_images") or [])
+                        )
+                    )
+                    new_meta = dict(meta)
+                    new_meta["related_images"] = merged_imgs
+                    hh = block.get("section_heading_hints")
+                    if hh:
+                        new_meta["section_heading_hints"] = hh
+                    expanded = Document(page_content=body, metadata=new_meta)
+            if pk in parent_slot:
+                idx = parent_slot[pk]
+                if self._prefer_rag_parent_document(out[idx], expanded):
+                    out[idx] = expanded
                 continue
-            body = (block.get("content") or "").strip()
-            if not body:
-                out.append(doc)
-                continue
-            merged_imgs = list(
-                dict.fromkeys(
-                    list(meta.get("related_images") or [])
-                    + list(block.get("related_images") or [])
-                )
-            )
-            new_meta = dict(meta)
-            new_meta["related_images"] = merged_imgs
-            hh = block.get("section_heading_hints")
-            if hh:
-                new_meta["section_heading_hints"] = hh
-            out.append(Document(page_content=body, metadata=new_meta))
+            parent_slot[pk] = len(out)
+            out.append(expanded)
         return out
 
     def _select_docs_for_rag(self, question: str, docs: List[Document]) -> List[Document]:
         """
         进入 RAG 前的筛选：
-        1. 正常路径：先按主阈值过滤，再按产品 source 过滤；
-        2. 兜底路径：在同产品源内放宽阈值补充候选，减少高分但错章节导致的漏答。
+        1. 先按主阈值过滤，再按产品 source 过滤；
+        2. 对保留下来的高置信片段补相邻 chunk，但原始检索低于主阈值的片段不回填。
         """
         thresholded = self._filter_docs_above_rag_threshold(docs)
-        selected = filter_documents_by_manual_source(question, thresholded)
-        source_filtered = filter_documents_by_manual_source(question, docs)
-        relaxed = self._filter_docs_above_fallback_threshold(source_filtered)
-        candidates = self._merge_doc_lists_preserve_order(selected + relaxed)
+        candidates = filter_documents_by_manual_source(question, thresholded)
+        candidates = self._merge_doc_lists_preserve_order(candidates)
         candidates = self._drop_low_information_docs(candidates)
-        candidates = self._expand_with_adjacent_chunks(question, candidates)
+        candidates = self._expand_with_adjacent_chunks(question, candidates, docs)
         prioritized = self._prioritize_docs_by_section_intent(question, candidates)
         prioritized = self._expand_documents_to_parents(prioritized)
+        prioritized = self._pin_adjacent_parent_groups(prioritized)
         return self._limit_rag_context_documents(prioritized)
 
     def _filter_docs_above_rag_threshold(self, docs: List[Document]) -> List[Document]:
@@ -836,15 +990,6 @@ class CustomerServiceAgent:
             if raw is None:
                 continue
             if raw > thr:
-                kept.append(doc)
-        return kept
-
-    def _filter_docs_above_fallback_threshold(self, docs: List[Document]) -> List[Document]:
-        """按放宽阈值保留同产品候选；中文、英文共用同一阈值配置。"""
-        kept: List[Document] = []
-        for doc in docs:
-            raw = self._retrieval_score_for_threshold(doc)
-            if raw is None or raw > self.rag_fallback_relevance_threshold:
                 kept.append(doc)
         return kept
 
@@ -939,31 +1084,249 @@ class CustomerServiceAgent:
         return len(body) <= 20 and len(doc.metadata.get("related_images", [])) <= 2
 
     def _expand_with_adjacent_chunks(
-        self, question: str, docs: List[Document]
+        self,
+        question: str,
+        docs: List[Document],
+        raw_docs: List[Document],
     ) -> List[Document]:
         """
-        说明书步骤常被切到相邻 chunk；对步骤/安装/连接类问题补入后续片段，
-        防止只答第 1 步、漏掉第 2/3 步或输出“参见”的残片。
+        说明书连续条目常被切到相邻 parent；对检索命中的子块先取 parent_id，
+        再补入同手册内 parent_id ± offset 的相邻段落，避免漏掉紧邻章节。
         """
-        if not docs or not self._should_include_adjacent_chunks(question):
+        if not docs:
             return docs
+        raw_by_parent = self._documents_by_source_parent_id(raw_docs)
+        raw_by_chunk = self._documents_by_source_chunk_id(raw_docs)
         expanded: List[Document] = []
         for doc in docs:
-            expanded.append(doc)
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            if not source:
+                expanded.append(doc)
+                continue
+
+            parent_id = meta.get("parent_id")
+            base_parent: Optional[int] = None
+            if parent_id is not None:
+                try:
+                    base_parent = int(parent_id)
+                except (TypeError, ValueError):
+                    base_parent = None
+
+            group: List[Document] = [doc]
+            if base_parent is not None:
+                for offset in (-1, 1):
+                    neighbor_key = (source, base_parent + offset)
+                    raw_neighbor = raw_by_parent.get(neighbor_key)
+                    neighbor = (
+                        raw_neighbor
+                        or self.chunk_document_by_parent_lookup.get(neighbor_key)
+                        or self._document_from_parent_sidecar(
+                            source, base_parent + offset
+                        )
+                    )
+                    if neighbor is not None:
+                        group.append(
+                            self._with_adjacent_context_score(neighbor, doc)
+                        )
+            else:
+                chunk_id = meta.get("chunk_id")
+                if chunk_id is None:
+                    expanded.append(doc)
+                    continue
+                try:
+                    base_id = int(chunk_id)
+                except (TypeError, ValueError):
+                    expanded.append(doc)
+                    continue
+                for offset in (-1, 1, 2):
+                    neighbor_key = (source, base_id + offset)
+                    raw_neighbor = raw_by_chunk.get(neighbor_key)
+                    neighbor = raw_neighbor or self.chunk_document_lookup.get(
+                        neighbor_key
+                    )
+                    if neighbor is not None:
+                        group.append(
+                            self._with_adjacent_context_score(neighbor, doc)
+                        )
+            expanded.extend(self._sort_docs_by_source_parent_order(group))
+        return self._merge_doc_lists_preserve_order(expanded)
+
+    def _document_from_parent_sidecar(
+        self,
+        source: str,
+        parent_id: int,
+    ) -> Optional[Document]:
+        """从 chunks_parents.jsonl 构造相邻 parent 文档（无子块命中时的兜底）。"""
+        lk = getattr(self, "chunk_parents_lookup", {}) or {}
+        block = lk.get((source, parent_id))
+        if not block:
+            return None
+        body = (block.get("content") or "").strip()
+        if not body:
+            return None
+        meta: dict = {
+            "source": source,
+            "parent_id": parent_id,
+            "related_images": list(block.get("related_images") or []),
+        }
+        hh = block.get("section_heading_hints")
+        if hh:
+            meta["section_heading_hints"] = hh
+        return Document(page_content=body, metadata=meta)
+
+    @staticmethod
+    def _documents_by_source_chunk_id(
+        docs: List[Document],
+    ) -> dict[tuple[str, int], Document]:
+        out: dict[tuple[str, int], Document] = {}
+        for doc in docs:
             meta = doc.metadata or {}
             source = meta.get("source") or ""
             chunk_id = meta.get("chunk_id")
             if not source or chunk_id is None:
                 continue
             try:
-                base_id = int(chunk_id)
+                key = (source, int(chunk_id))
             except (TypeError, ValueError):
                 continue
-            for offset in (-2, -1, 1, 2):
-                neighbor = self.chunk_document_lookup.get((source, base_id + offset))
+            existing = out.get(key)
+            if existing is None:
+                out[key] = doc
+                continue
+            existing_score = CustomerServiceAgent._retrieval_score_for_threshold(existing)
+            new_score = CustomerServiceAgent._retrieval_score_for_threshold(doc)
+            if (new_score or 0.0) > (existing_score or 0.0):
+                out[key] = doc
+        return out
+
+    @staticmethod
+    def _documents_by_source_parent_id(
+        docs: List[Document],
+    ) -> dict[tuple[str, int], Document]:
+        out: dict[tuple[str, int], Document] = {}
+        for doc in docs:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            parent_id = meta.get("parent_id")
+            if not source or parent_id is None:
+                continue
+            try:
+                key = (source, int(parent_id))
+            except (TypeError, ValueError):
+                continue
+            existing = out.get(key)
+            if existing is None:
+                out[key] = doc
+                continue
+            existing_score = CustomerServiceAgent._retrieval_score_for_threshold(existing)
+            new_score = CustomerServiceAgent._retrieval_score_for_threshold(doc)
+            if (new_score or 0.0) > (existing_score or 0.0):
+                out[key] = doc
+        return out
+
+    def _doc_passes_rag_threshold(self, doc: Document) -> bool:
+        score = self._retrieval_score_for_threshold(doc)
+        return score is None or score > self.rag_relevance_threshold
+
+    def _with_adjacent_context_score(
+        self,
+        neighbor: Document,
+        anchor: Document,
+    ) -> Document:
+        anchor_meta = anchor.metadata or {}
+        meta = dict(neighbor.metadata or {})
+        anchor_score = self._retrieval_score_for_threshold(anchor)
+        if meta.get("retrieval_score") is None and anchor_score is not None:
+            meta["retrieval_score"] = anchor_score
+            meta["relevance_score"] = anchor_meta.get(
+                "relevance_score",
+                anchor_score,
+            )
+        meta["adjacent_context"] = True
+        anchor_parent = anchor_meta.get("parent_id")
+        if anchor_parent is None:
+            anchor_parent = anchor_meta.get("chunk_id")
+        if anchor_parent is not None:
+            meta["adjacent_anchor_parent_id"] = anchor_parent
+        return Document(page_content=neighbor.page_content, metadata=meta)
+
+    def _pin_adjacent_parent_groups(self, docs: List[Document]) -> List[Document]:
+        """
+        把同手册内 parent_id ± offset 的段落钉在锚点之后。
+        相邻段可能来自补召回，也可能本身就被检索命中（无 adjacent_context 标记）。
+        """
+        if not docs:
+            return docs
+
+        neighbor_offsets = (-1, 1, 2)
+        by_parent: dict[tuple[str, int], Document] = {}
+        for doc in docs:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            parent_id = meta.get("parent_id")
+            if not source or parent_id is None:
+                continue
+            try:
+                key = (source, int(parent_id))
+            except (TypeError, ValueError):
+                continue
+            existing = by_parent.get(key)
+            if existing is None or self._prefer_rag_parent_document(existing, doc):
+                by_parent[key] = doc
+
+        seen: set[str] = set()
+        ordered: List[Document] = []
+        for doc in docs:
+            sig = doc.page_content.strip()
+            if sig in seen:
+                continue
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            parent_id = meta.get("parent_id")
+            if not source or parent_id is None:
+                ordered.append(doc)
+                seen.add(sig)
+                continue
+            try:
+                anchor_parent = int(parent_id)
+            except (TypeError, ValueError):
+                ordered.append(doc)
+                seen.add(sig)
+                continue
+
+            preferred = by_parent.get((source, anchor_parent))
+            if preferred is None or preferred.page_content.strip() != sig:
+                ordered.append(doc)
+                seen.add(sig)
+                continue
+
+            ordered.append(doc)
+            seen.add(sig)
+            neighbors: List[Document] = []
+            for offset in neighbor_offsets:
+                neighbor_key = (source, anchor_parent + offset)
+                neighbor = by_parent.get(neighbor_key)
+                if neighbor is None:
+                    neighbor = self._document_from_parent_sidecar(
+                        source, anchor_parent + offset
+                    )
                 if neighbor is not None:
-                    expanded.append(neighbor)
-        return self._merge_doc_lists_preserve_order(expanded)
+                    neighbors.append(neighbor)
+            for neighbor in self._sort_docs_by_source_parent_order(neighbors):
+                neighbor_sig = neighbor.page_content.strip()
+                if neighbor_sig in seen:
+                    continue
+                ordered.append(neighbor)
+                seen.add(neighbor_sig)
+
+        for doc in docs:
+            sig = doc.page_content.strip()
+            if sig in seen:
+                continue
+            ordered.append(doc)
+            seen.add(sig)
+        return ordered
 
     @staticmethod
     def _sort_docs_by_source_chunk_order(docs: List[Document]) -> List[Document]:
@@ -979,17 +1342,21 @@ class CustomerServiceAgent:
         return sorted(docs, key=key)
 
     @staticmethod
-    def _should_include_adjacent_chunks(question: str) -> bool:
-        q = (question or "").lower()
-        return bool(
-            re.search(
-                r"how to|steps?|procedure|install|connect|charge|recharg|erase|delete|"
-                r"view.*tv|tv.*view|first three|assembly|start|replace|clean|flush|"
-                r"set up|设置|安装|连接|步骤|删除|查看|充电|更换|清洁|启动",
-                q,
-                re.IGNORECASE,
-            )
-        )
+    def _sort_docs_by_source_parent_order(docs: List[Document]) -> List[Document]:
+        def key(doc: Document) -> tuple[str, int, int]:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            try:
+                parent_id = int(meta.get("parent_id"))
+            except (TypeError, ValueError):
+                parent_id = 10**9
+            try:
+                chunk_id = int(meta.get("chunk_id"))
+            except (TypeError, ValueError):
+                chunk_id = 10**9
+            return source, parent_id, chunk_id
+
+        return sorted(docs, key=key)
 
     def _merge_doc_lists_preserve_order(self, docs: List[Document]) -> List[Document]:
         """按正文去重，保留首次出现顺序；若后续重复分数更高则替换文档内容。"""
@@ -1006,17 +1373,72 @@ class CustomerServiceAgent:
             new_score = self._retrieval_score_for_threshold(doc) or 0.0
             if new_score > existing_score:
                 seen[sig] = doc
+            elif new_score == existing_score and self._prefer_rag_parent_document(
+                existing, doc
+            ):
+                seen[sig] = doc
         return [seen[sig] for sig in order]
 
     def _limit_rag_context_documents(self, docs: List[Document]) -> List[Document]:
         """
-        截取进入 prompt 的条数；保持检索器返回顺序（精排序），不再按分数重排，
-        避免把「向量高分但非最贴题」的段重新顶到最前。
+        截取进入 prompt 的条数；保持检索器返回顺序（精排序），不再按分数重排。
+        若锚点已入选，其相邻 parent 补召回段落仍保留（可略超 cap）。
         """
         cap = self.rag_max_context_documents
         if cap is None or cap <= 0:
             return docs
-        return docs[:cap]
+
+        base = docs[:cap]
+        kept_sigs = {doc.page_content.strip() for doc in base}
+        kept_anchors: set[tuple[str, int]] = set()
+        for doc in base:
+            meta = doc.metadata or {}
+            if meta.get("adjacent_context"):
+                continue
+            source = meta.get("source") or ""
+            parent_id = meta.get("parent_id")
+            if not source or parent_id is None:
+                continue
+            try:
+                kept_anchors.add((source, int(parent_id)))
+            except (TypeError, ValueError):
+                continue
+
+        by_parent: dict[tuple[str, int], Document] = {}
+        for doc in docs:
+            meta = doc.metadata or {}
+            source = meta.get("source") or ""
+            parent_id = meta.get("parent_id")
+            if not source or parent_id is None:
+                continue
+            try:
+                key = (source, int(parent_id))
+            except (TypeError, ValueError):
+                continue
+            existing = by_parent.get(key)
+            if existing is None or self._prefer_rag_parent_document(existing, doc):
+                by_parent[key] = doc
+
+        extras: List[Document] = []
+        for source, anchor_parent in kept_anchors:
+            for offset in (-1, 1, 2):
+                neighbor_key = (source, anchor_parent + offset)
+                neighbor = by_parent.get(neighbor_key)
+                if neighbor is None:
+                    neighbor = self._document_from_parent_sidecar(
+                        source, anchor_parent + offset
+                    )
+                if neighbor is None:
+                    continue
+                sig = neighbor.page_content.strip()
+                if sig in kept_sigs:
+                    continue
+                extras.append(neighbor)
+                kept_sigs.add(sig)
+
+        if not extras:
+            return base
+        return self._pin_adjacent_parent_groups(base + extras)
 
     def _may_use_customer_service_llm(self, question: str) -> bool:
         """英文及已命中产品手册的问题不走通用客服，避免说明书题被泛答。"""
